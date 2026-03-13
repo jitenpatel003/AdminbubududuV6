@@ -1,0 +1,32 @@
+{
+  "hosting": {
+    "target": "admin",
+    "public": "build",
+    "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+    "rewrites": [
+      {
+        "source": "**",
+        "destination": "/index.html"
+      }
+    ]
+  }
+}
+```
+
+---
+
+## Step 3 — Connect `adminbubududu.com`
+
+In Firebase Hosting → click on the new **adminbubududu** site → **Add custom domain** → type `adminbubududu.com` → Firebase gives you the A records → add them to your domain registrar's DNS.
+
+---
+
+## The Full Picture
+```
+bubu-dudu-orders (Firebase project)
+        │
+        ├── Firestore Database ← shared by both
+        │
+        ├── Hosting Site 1: bubududucustom.com  → Booking Form
+        │
+        └── Hosting Site 2: adminbubududu.com   → Admin Panel
