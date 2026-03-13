@@ -1,0 +1,12 @@
+{
+  "projects": {
+    "default": "bubu-dudu-orders"
+  },
+  "targets": {
+    "bubu-dudu-orders": {
+      "hosting": {
+        "admin": ["adminbubududu"]
+      }
+    }
+  }
+}
