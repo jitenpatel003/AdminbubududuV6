@@ -10,13 +10,3 @@ root.render(
     <App />
   </StrictMode>
 );
-
-// ── PWA Service Worker ────────────────────────────────────────
-if ("serviceWorker" in navigator) {
-  window.addEventListener("load", () => {
-    navigator.serviceWorker
-      .register(`${process.env.PUBLIC_URL}/sw.js`)
-      .then((reg) => console.log("SW registered:", reg.scope))
-      .catch((err) => console.log("SW failed:", err));
-  });
-}
