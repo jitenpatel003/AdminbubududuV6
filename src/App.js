@@ -4,7 +4,7 @@
 //  Firebase · Fully Updated to Match Booking Form
 // ═══════════════════════════════════════════════════════════════
 
-import { useState, useMemo, useEffect, useRef } from "react";
+import React, { useState, useMemo, useEffect, useRef } from "react";
 import {
   LayoutDashboard, Calendar, Bell, Search,
   ChevronLeft, ChevronRight, X, Check, AlertTriangle, Clock,
@@ -19,7 +19,7 @@ import {
 import { initializeApp } from "firebase/app";
 import {
   getFirestore, collection, onSnapshot, doc, updateDoc,
-  query, orderBy, addDoc,
+  query, orderBy, addDoc, serverTimestamp, limit, startAfter, getDocs,
 } from "firebase/firestore";
 
 // ── FIREBASE CONFIG ───────────────────────────────────────────
@@ -34,14 +34,44 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const db  = getFirestore(app);
 
-const ADMIN_PIN = "bubu2024";
+const ADMIN_PIN_HASH = "ae8ab5c048a79efa2a72ad57720fd743b07408c9cdfbfb1cc6869a0b41716708";
+
+async function hashPin(pin) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(pin + "bubududu_salt_2024");
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { hasError: false, error: null }; }
+  static getDerivedStateFromError(error) { return { hasError: true, error }; }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ padding: 40, textAlign: "center", fontFamily: "'Nunito', sans-serif" }}>
+          <div style={{ fontSize: 40, marginBottom: 16 }}>⚠️</div>
+          <div style={{ fontSize: 18, fontWeight: 800, color: "#DC2626", marginBottom: 8 }}>Something went wrong</div>
+          <div style={{ fontSize: 13, color: "#6B7280", marginBottom: 20 }}>{this.state.error?.message}</div>
+          <button onClick={() => { this.setState({ hasError: false }); window.location.reload(); }}
+            style={{ padding: "10px 24px", background: "#6D28D9", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontFamily: "'Nunito', sans-serif", fontWeight: 700 }}>
+            Reload Panel
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 const STATUSES = [
-  { key: "Script Review",    label: "Script Review",    color: "#fff", bg: "#2563EB", pct: 0  },
-  { key: "Script Approved",  label: "Script Approved",  color: "#fff", bg: "#7C3AED", pct: 20 },
-  { key: "In Progress",      label: "In Progress",      color: "#fff", bg: "#D97706", pct: 50 },
-  { key: "Preview Sent",     label: "Preview Sent",     color: "#fff", bg: "#6D28D9", pct: 75 },
-  { key: "Completed",        label: "Completed",        color: "#fff", bg: "#15803D", pct: 100 },
+  { key: "Script Review",        label: "Script Review",        color: "#fff", bg: "#2563EB", pct: 0  },
+  { key: "Script Approved",      label: "Script Approved",      color: "#fff", bg: "#7C3AED", pct: 20 },
+  { key: "Waiting On Customer",  label: "Waiting On Customer",  color: "#fff", bg: "#0891B2", pct: 40 },
+  { key: "In Progress",          label: "In Progress",          color: "#fff", bg: "#D97706", pct: 50 },
+  { key: "Preview Sent",         label: "Preview Sent",         color: "#fff", bg: "#6D28D9", pct: 75 },
+  { key: "Completed",            label: "Completed",            color: "#fff", bg: "#15803D", pct: 100 },
 ];
 const ARCHIVED_STATUS = { key: "Archived", label: "Archived", color: "#fff", bg: "#6B7280", pct: 0 };
 const ALL_STATUSES = [...STATUSES, ARCHIVED_STATUS];
@@ -118,7 +148,11 @@ const LEGACY_STATUS_MAP = {
 const sCfg = (k) => ALL_STATUSES.find((s) => s.key === k) || LEGACY_STATUS_MAP[k] || STATUSES[0];
 const pCfg      = (k) => PRIORITIES.find((p) => p.key === k) || PRIORITIES[0];
 const isArchived = (o) => o.status === "Archived" || o.status === "Draft";
-const hoursLeft = (d) => Math.ceil((new Date(d) - new Date()) / 3600000);
+const hoursLeft = (d) => {
+  if (!d) return 999;
+  const deadline = new Date(d + "T23:59:59+05:30");
+  return Math.ceil((deadline - new Date()) / 3600000);
+};
 const smartDL   = (d) => {
   const h = hoursLeft(d);
   if (h < 0)    return `${Math.abs(Math.ceil(h / 24))}d overdue`;
@@ -180,13 +214,18 @@ const playBeep = () => {
 // ═══════════════════════════════════════════════════════════════
 // ROOT COMPONENT
 // ═══════════════════════════════════════════════════════════════
-export default function AdminPanel() {
+function AdminPanelInner() {
 
   // ── AUTH ───────────────────────────────────────────────────
-  const [authed,  setAuthed]  = useState(false);
+  const [authed,  setAuthed]  = useState(() => {
+    try { return sessionStorage.getItem("bd_session") === ADMIN_PIN_HASH; } catch { return false; }
+  });
   const [pin,     setPin]     = useState("");
   const [pinErr,  setPinErr]  = useState("");
+  const lastActivityRef = useRef(Date.now());
   const [orders,  setOrders]  = useState([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [lastDoc, setLastDoc] = useState(null);
   const [loading, setLoading] = useState(true);
   const [syncStatus, setSyncStatus] = useState("connecting");
   const [page,    setPage]    = useState("dash");
@@ -200,6 +239,24 @@ export default function AdminPanel() {
     return () => window.removeEventListener("resize", h);
   }, []);
 
+  // ── AUTO-LOCK ─────────────────────────────────────────────
+  useEffect(() => {
+    const resetTimer = () => { lastActivityRef.current = Date.now(); };
+    const events = ["mousedown", "keydown", "touchstart", "scroll"];
+    events.forEach(e => window.addEventListener(e, resetTimer));
+    const lockCheck = setInterval(() => {
+      if (authed && Date.now() - lastActivityRef.current > 30 * 60 * 1000) {
+        setAuthed(false);
+        sessionStorage.removeItem("bd_session");
+        setPin("");
+      }
+    }, 60000);
+    return () => {
+      events.forEach(e => window.removeEventListener(e, resetTimer));
+      clearInterval(lockCheck);
+    };
+  }, [authed]);
+
   // ── FILTERS (Orders page) ─────────────────────────────────
   const [fStatus,   setFS]    = useState("All");
   const [fCountry,  setFC]    = useState("All");
@@ -209,9 +266,15 @@ export default function AdminPanel() {
   const [fPriority, setFP]    = useState("All");
   const [fTag,      setFTag]  = useState("All");
   const [search,    setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [sortK,     setSortK] = useState("date");
   const [sortD,     setSortD] = useState("desc");
   const [filterOpen, setFilterOpen] = useState(false);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(search), 300);
+    return () => clearTimeout(timer);
+  }, [search]);
 
   // ── LAZY LOADING ──────────────────────────────────────────
   const [visible, setVisible] = useState(30);
@@ -249,7 +312,7 @@ export default function AdminPanel() {
     shortPrice: 40, longPrice: 80, maxCapacity: 8, orderIdPrefix: "BD",
     soundEnabled: true,
     workingHoursStart: "09:00", workingHoursEnd: "20:00",
-    adminName: "Admin", businessName: "Bubu Dudu", adminPhoto: "",
+    adminName: "Admin", businessName: "Bubu Dudu", adminPhoto: "", adminWhatsApp: "919265802481",
     briefingTime: "09:00",
     emailTemplates: {
       scriptApproved: { subject: "Your Script Is Approved! 🎬", body: "Hi {name},\n\nGreat news! Your script has been approved and we are now starting the animation.\n\nOrder ID: {orderId}\n\nWe'll send you a preview soon!\n\nBubu Dudu Team" },
@@ -279,7 +342,11 @@ export default function AdminPanel() {
   const sh   = "0 1px 8px rgba(0,0,0,0.06)";
   const shMd = "0 4px 20px rgba(0,0,0,0.1)";
 
-  const calcRevenue = (o) => (o.length?.includes("40") || o.length?.toLowerCase().includes("short")) ? settings.shortPrice : settings.longPrice;
+  const calcRevenue = (o) => {
+    const len = (o.length || "").toLowerCase();
+    const isShort = len.includes("40") || len.includes("short");
+    return isShort ? settings.shortPrice : settings.longPrice;
+  };
 
   const toast_ = (msg) => { setToast(msg); setTimeout(() => setToast(""), 3500); };
 
@@ -287,7 +354,7 @@ export default function AdminPanel() {
   useEffect(() => {
     if (!authed) return;
     setLoading(true);
-    const q = query(collection(db, "orders"), orderBy("createdAt", "desc"));
+    const q = query(collection(db, "orders"), orderBy("createdAt", "desc"), limit(100));
     const unsub = onSnapshot(q, (snap) => {
       const data = snap.docs.map((d) => ({ ...d.data(), _docId: d.id }));
       if (prevCountRef.current > 0 && data.length > prevCountRef.current) {
@@ -299,6 +366,8 @@ export default function AdminPanel() {
       }
       prevCountRef.current = data.length;
       setOrders(data);
+      setHasMore(snap.docs.length === 100);
+      setLastDoc(snap.docs[snap.docs.length - 1] || null);
       setLoading(false);
       setSyncStatus("live");
     }, (err) => {
@@ -309,6 +378,22 @@ export default function AdminPanel() {
     return () => unsub();
   }, [authed]);
 
+  const loadMore = async () => {
+    if (!lastDoc) return;
+    try {
+      const more = await getDocs(
+        query(collection(db, "orders"), orderBy("createdAt", "desc"), startAfter(lastDoc), limit(50))
+      );
+      const moreData = more.docs.map(d => ({ ...d.data(), _docId: d.id }));
+      setOrders(prev => [...prev, ...moreData]);
+      setLastDoc(more.docs[more.docs.length - 1] || null);
+      setHasMore(more.docs.length === 50);
+    } catch (e) {
+      console.error("Firestore read failed:", e);
+      toast_("Failed to load more orders — check connection");
+    }
+  };
+
   // ── DERIVED LISTS (useMemo for performance) ───────────────
   const archivedOrders  = useMemo(() => orders.filter(isArchived), [orders]);
   const activeOrders    = useMemo(() => orders.filter((o) => !isArchived(o) && o.status !== "Completed"), [orders]);
@@ -316,15 +401,26 @@ export default function AdminPanel() {
   const approvedOrders  = useMemo(() => orders.filter((o) => !isArchived(o)), [orders]);
 
   // ── STATS ─────────────────────────────────────────────────
-  const stats = useMemo(() => ({
-    totalApproved: approvedOrders.length,
-    totalRevenue:  completedOrders.reduce((s, o) => s + calcRevenue(o), 0),
-    inProgress:    activeOrders.filter(o => PRODUCTION_STATUSES.includes(o.status) || ["Script Writing","Waiting For Approval","Animation In Progress","Final Delivery"].includes(o.status)).length,
-    completed:     completedOrders.length,
-    totalReceived: orders.length,
-    overdue:       activeOrders.filter((o) => hoursLeft(o.deadline) < 0).length,
-    urgent:        activeOrders.filter((o) => { const h = hoursLeft(o.deadline); return h >= 0 && h <= 48; }).length,
-  }), [approvedOrders, completedOrders, activeOrders, orders, settings.shortPrice, settings.longPrice]);
+  const stats = useMemo(() => {
+    let totalRevenue = 0, inProgress = 0, completed = 0, overdue = 0, urgent = 0;
+    let totalApproved = 0;
+    const totalReceived = orders.length;
+    const PROD = new Set(["Script Approved","In Progress","Preview Sent","Script Writing","Waiting For Approval","Animation In Progress","Final Delivery"]);
+    orders.forEach(o => {
+      if (!isArchived(o)) totalApproved++;
+      if (o.status === "Completed") {
+        completed++;
+        totalRevenue += calcRevenue(o);
+      }
+      if (!isArchived(o) && o.status !== "Completed") {
+        if (PROD.has(o.status)) inProgress++;
+        const h = hoursLeft(o.deadline);
+        if (h < 0) overdue++;
+        else if (h <= 48) urgent++;
+      }
+    });
+    return { totalApproved, totalRevenue, inProgress, completed, totalReceived, overdue, urgent };
+  }, [orders, settings.shortPrice, settings.longPrice]);
 
   // ── ALL-ORDERS FILTER (Orders page) ───────────────────────
   const filteredAll = useMemo(() => {
@@ -342,8 +438,8 @@ export default function AdminPanel() {
     if (fDelivery !== "All") a = a.filter((o) => o.delivery === fDelivery);
     if (fPriority !== "All") a = a.filter((o) => (o.priority || "Normal") === fPriority);
     if (fTag      !== "All") a = a.filter((o) => (o.tags || []).includes(fTag));
-    if (search.trim()) {
-      const terms = search.toLowerCase().split(/\s+/).filter(Boolean);
+    if (debouncedSearch.trim()) {
+      const terms = debouncedSearch.toLowerCase().split(/\s+/).filter(Boolean);
       a = a.filter((o) =>
         terms.every((t) =>
           o.id?.toLowerCase().includes(t) ||
@@ -360,7 +456,7 @@ export default function AdminPanel() {
       return sortD === "asc" ? (vx < vy ? -1 : vx > vy ? 1 : 0) : (vx > vy ? -1 : vx < vy ? 1 : 0);
     });
     return a;
-  }, [orders, activeOrdersTab, fStatus, fCountry, fLanguage, fLength, fDelivery, fPriority, fTag, search, sortK, sortD]);
+  }, [orders, activeOrdersTab, fStatus, fCountry, fLanguage, fLength, fDelivery, fPriority, fTag, debouncedSearch, sortK, sortD]);
 
   // ── SMART NOTIFICATIONS ───────────────────────────────────
   const smartNotifications = useMemo(() => {
@@ -400,30 +496,40 @@ export default function AdminPanel() {
   const updateOrder = async (ord, changes) => {
     if (!ord._docId) return;
     try { await updateDoc(doc(db, "orders", ord._docId), changes); }
-    catch (e) { toast_("Save failed — check connection"); }
+    catch (e) { console.error("Firestore write failed:", e); toast_("Save failed — check connection"); }
   };
 
   const setStatus = async (ord, s) => {
     const prevTimeline = ord.timeline || [];
     const entry = { event: `Status → ${s}`, ts: fmtTS() };
-    await updateOrder(ord, { status: s, timeline: [...prevTimeline, entry] });
-    toast_(`Status updated: ${s}`);
-    if (s === "Completed") {
-      setShowConfetti(true);
-      setTimeout(() => setShowConfetti(false), 3000);
-      const newCount = completedOrders.length + 1;
-      const MILESTONES = [10, 25, 50, 100, 250, 500];
-      if (MILESTONES.includes(newCount)) {
-        setMilestoneMsg(`🎉 Amazing! You just completed your ${newCount}th order!`);
-        setTimeout(() => setMilestoneMsg(""), 6000);
+    try {
+      await updateOrder(ord, { status: s, timeline: [...prevTimeline, entry] });
+      toast_(`Status updated: ${s}`);
+      if (s === "Completed") {
+        setShowConfetti(true);
+        setTimeout(() => setShowConfetti(false), 3000);
+        const newCount = completedOrders.length + 1;
+        const MILESTONES = [10, 25, 50, 100, 250, 500];
+        if (MILESTONES.includes(newCount)) {
+          setMilestoneMsg(`🎉 Amazing! You just completed your ${newCount}th order!`);
+          setTimeout(() => setMilestoneMsg(""), 6000);
+        }
       }
+    } catch (e) {
+      toast_("Failed to update status — check connection");
+      throw e;
     }
   };
 
   const setPri = async (ord, p) => {
     const prevTimeline = ord.timeline || [];
     const entry = { event: `Priority → ${p}`, ts: fmtTS() };
-    await updateOrder(ord, { priority: p, timeline: [...prevTimeline, entry] });
+    try {
+      await updateOrder(ord, { priority: p, timeline: [...prevTimeline, entry] });
+      toast_(`Priority updated: ${p}`);
+    } catch (e) {
+      toast_("Failed to update priority — check connection");
+    }
   };
 
   const addNote = async (ord) => {
@@ -432,9 +538,13 @@ export default function AdminPanel() {
     const newNote = { text: noteInput.trim(), ts: fmtTS() };
     const prevTimeline = ord.timeline || [];
     const entry = { event: `Note added`, ts: fmtTS() };
-    await updateOrder(ord, { adminNotesList: [...prev, newNote], timeline: [...prevTimeline, entry] });
-    setNoteInput("");
-    toast_("Note saved");
+    try {
+      await updateOrder(ord, { adminNotesList: [...prev, newNote], timeline: [...prevTimeline, entry] });
+      setNoteInput("");
+      toast_("Note saved");
+    } catch (e) {
+      toast_("Failed to save note — check connection");
+    }
   };
 
   const copyScript = () => {
@@ -486,30 +596,44 @@ export default function AdminPanel() {
   };
 
   const duplicateOrder = async (ord) => {
-    const newId = `${ord.id}-DUP`;
+    const newId = `BD-${10001 + Math.floor(Math.random() * 89999)}`;
     const copy  = { ...ord };
     delete copy._docId;
     Object.assign(copy, {
       id: newId, status: "Script Review",
       timeline: [{ event: `Duplicated from ${ord.id}`, ts: fmtTS() }],
       adminNotesList: [], tasks: [],
-      createdAt: new Date().toISOString(),
+      createdAt: serverTimestamp(),
       date: new Date().toISOString().split("T")[0],
       draftReason: "",
     });
     try {
       await addDoc(collection(db, "orders"), copy);
       toast_(`Duplicated as ${newId}`);
-    } catch (e) { toast_("Duplicate failed — check connection"); }
+    } catch (e) { console.error("Firestore write failed:", e); toast_("Duplicate failed — check connection"); }
   };
 
   const bulkMarkCompleted = async () => {
+    let successCount = 0;
+    let failCount = 0;
     for (const id of selectedIds) {
       const ord = orders.find((o) => o.id === id);
-      if (ord) await setStatus(ord, "Completed");
+      if (ord) {
+        try {
+          await setStatus(ord, "Completed");
+          successCount++;
+        } catch (e) {
+          failCount++;
+        }
+      }
     }
-    toast_(`${selectedIds.size} orders marked completed`);
-    setSelectedIds(new Set()); setBulkMode(false);
+    if (failCount > 0) {
+      toast_(`${successCount} updated · ${failCount} failed — check connection`);
+    } else {
+      toast_(`${successCount} orders marked completed`);
+    }
+    setSelectedIds(new Set());
+    setBulkMode(false);
   };
 
   const exportCSV = () => {
@@ -606,6 +730,19 @@ export default function AdminPanel() {
     </div>
   );
 
+  const CopyRow = ({ label, value }) => (
+    <div style={{ display: "flex", gap: 12, marginBottom: 9, alignItems: "flex-start" }}>
+      <span style={{ fontSize: 12, color: C.su, fontWeight: 600, minWidth: isMobile ? 100 : 130, flexShrink: 0 }}>{label}</span>
+      <span style={{ fontSize: 13, color: C.tx, fontWeight: 600, flex: 1 }}>{value || "—"}</span>
+      {value && (
+        <button onClick={() => navigator.clipboard.writeText(value).then(() => toast_(`${label} copied!`))}
+          style={{ background: "none", border: "none", cursor: "pointer", color: C.su, padding: 0, display: "flex", flexShrink: 0 }}>
+          <Copy size={13} />
+        </button>
+      )}
+    </div>
+  );
+
   const Btn = ({ children, onClick, color = C.pu, size = "md", outline = false, icon: BtnIcon, disabled }) => {
     const pad = size === "sm" ? "6px 14px" : "9px 18px";
     const fs  = size === "sm" ? 11 : 13;
@@ -617,6 +754,16 @@ export default function AdminPanel() {
   };
 
   // ── LOGIN ─────────────────────────────────────────────────
+  const handleLogin = async () => {
+    const entered = await hashPin(pin);
+    if (entered === ADMIN_PIN_HASH) {
+      setAuthed(true);
+      sessionStorage.setItem("bd_session", entered);
+    } else {
+      setPinErr("Incorrect PIN. Try again.");
+    }
+  };
+
   if (!authed) return (
     <div style={{ minHeight: "100vh", background: "#0F172A", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: font, padding: 20 }}>
       <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap" rel="stylesheet" />
@@ -628,12 +775,12 @@ export default function AdminPanel() {
           <label style={{ fontSize: 11, fontWeight: 700, color: "#64748B", letterSpacing: 0.8, display: "block", marginBottom: 6 }}>ADMIN PIN</label>
           <input type="password" value={pin}
             onChange={(e) => setPin(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && (pin === ADMIN_PIN ? setAuthed(true) : setPinErr("Incorrect PIN. Try again."))}
+            onKeyDown={(e) => e.key === "Enter" && handleLogin()}
             placeholder="Enter your PIN…"
             style={{ width: "100%", padding: "13px 16px", borderRadius: 10, border: `1.5px solid ${pinErr ? "#DC2626" : "#334155"}`, fontSize: 16, fontFamily: font, color: "#F1F5F9", background: "#0F172A", outline: "none", boxSizing: "border-box", textAlign: "center", letterSpacing: 8 }} />
           {pinErr && <div style={{ fontSize: 12, color: "#F87171", marginTop: 6, fontWeight: 600 }}>{pinErr}</div>}
         </div>
-        <button onClick={() => pin === ADMIN_PIN ? setAuthed(true) : setPinErr("Incorrect PIN. Try again.")}
+        <button onClick={handleLogin}
           style={{ width: "100%", padding: 13, borderRadius: 10, background: "#6D28D9", color: "#fff", border: "none", fontSize: 15, fontWeight: 800, cursor: "pointer", fontFamily: font, marginTop: 8 }}>
           Enter Admin Panel
         </button>
@@ -724,7 +871,7 @@ export default function AdminPanel() {
         <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 8px" }}>
           <div style={{ width: 6, height: 6, borderRadius: "50%", background: syncStatus === "live" ? "#4ADE80" : syncStatus === "error" ? "#F87171" : "#FCD34D" }} />
           <span style={{ fontSize: 10, color: "#64748B" }}>
-            {syncStatus === "live" ? `Live · ${orders.length} orders` : syncStatus === "error" ? "Error" : "Connecting…"}
+            v4.1 · {syncStatus === "live" ? `Live · ${orders.length} orders` : syncStatus === "error" ? "Error" : "Connecting…"}
           </span>
         </div>
       </div>
@@ -752,6 +899,10 @@ export default function AdminPanel() {
   // ── ORDER CARD — Minimal redesign ─────────────────────────
   const OrderCard = ({ o, showRevenue = false }) => {
     const urgency = getUrgencyLevel(o);
+    const wasEdited = o.customerEditedAt && (
+      !o.timeline?.length ||
+      new Date(o.customerEditedAt) > new Date(o.timeline.slice(-1)[0]?.ts || 0)
+    );
     return (
       <div
         onClick={() => { setSelId(o.id); setPage("detail"); }}
@@ -762,7 +913,8 @@ export default function AdminPanel() {
         {/* Top row: Order ID + priority */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
           <span style={{ fontWeight: 900, color: C.pu, fontSize: 13, fontVariantNumeric: "tabular-nums" }}>{o.id}</span>
-          <div style={{ display: "flex", gap: 5 }}>
+          <div style={{ display: "flex", gap: 5, alignItems: "center" }}>
+            {wasEdited && <span style={{ background: "#FFF7ED", color: "#EA580C", fontSize: 9, fontWeight: 800, padding: "2px 6px", borderRadius: 4, border: "1px solid #FED7AA" }}>✏️ Edited</span>}
             {urgency && <span style={{ background: urgency.color + "20", color: urgency.color, fontSize: 9, fontWeight: 800, padding: "2px 6px", borderRadius: 4 }}>{urgency.emoji} {urgency.label}</span>}
             <PBadge priority={o.priority} />
           </div>
@@ -784,8 +936,16 @@ export default function AdminPanel() {
           {showRevenue && <span style={{ fontSize: 12, fontWeight: 700, color: C.gr }}>${calcRevenue(o)}</span>}
         </div>
 
-        {/* Status */}
+        {/* Status + age */}
         <Badge status={o.status} />
+        {(() => {
+          const orderAge = o.date ? Math.floor((Date.now() - new Date(o.date).getTime()) / 86400000) : null;
+          return orderAge > 3 ? (
+            <span style={{ fontSize: 10, color: orderAge > 7 ? C.re : C.or, fontWeight: 700, marginTop: 4, display: "block" }}>
+              {orderAge}d old
+            </span>
+          ) : null;
+        })()}
       </div>
     );
   };
@@ -953,7 +1113,7 @@ export default function AdminPanel() {
                         {o.deadline ? <DLChip deadline={o.deadline} /> : "—"}
                       </td>
                       <td style={{ padding: "13px 14px", whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
-                        <select value={o.status} onChange={(e) => setStatus(o, e.target.value)}
+                        <select value={sCfg(o.status).key} onChange={(e) => setStatus(o, e.target.value)}
                           style={{ padding: "5px 9px", borderRadius: 6, border: "none", fontSize: 11, fontWeight: 700, color: sCfg(o.status).color, background: sCfg(o.status).bg, cursor: "pointer", fontFamily: font, outline: "none", appearance: "none" }}>
                           {STATUSES.map((s) => <option key={s.key} value={s.key} style={{ background: "#fff", color: "#333" }}>{s.label}</option>)}
                         </select>
@@ -1081,8 +1241,16 @@ export default function AdminPanel() {
         {filteredAll.length === 0 ? (
           <div style={{ textAlign: "center", padding: "60px 20px", color: C.su }}>
             <Inbox size={40} style={{ margin: "0 auto 12px" }} />
-            <div style={{ fontSize: 16, fontWeight: 700 }}>No orders found</div>
-            <div style={{ fontSize: 13, marginTop: 4 }}>Try adjusting your filters</div>
+            <div style={{ fontSize: 16, fontWeight: 700 }}>
+              {debouncedSearch.trim()
+                ? `No results for "${debouncedSearch.trim()}" — try clearing filters`
+                : activeOrdersTab === "archived"
+                ? "No archived orders yet"
+                : "All caught up! No active orders 🎉"}
+            </div>
+            {!debouncedSearch.trim() && activeOrdersTab !== "archived" && (
+              <div style={{ fontSize: 13, marginTop: 4 }}>New orders will appear here</div>
+            )}
           </div>
         ) : (
           <>
@@ -1150,6 +1318,14 @@ export default function AdminPanel() {
                 <button onClick={() => setVisible((v) => v + 30)}
                   style={{ padding: "10px 28px", borderRadius: 10, background: C.li, border: `1px solid ${C.bo}`, fontSize: 13, fontWeight: 700, cursor: "pointer", fontFamily: font, color: C.su }}>
                   Load More ({filteredAll.length - visible} remaining)
+                </button>
+              </div>
+            )}
+            {hasMore && (
+              <div style={{ textAlign: "center", marginTop: 12 }}>
+                <button onClick={loadMore}
+                  style={{ padding: "10px 28px", borderRadius: 10, background: C.th, border: `1px solid ${C.pu}44`, fontSize: 13, fontWeight: 700, cursor: "pointer", fontFamily: font, color: C.pu }}>
+                  Load More Orders from Firestore
                 </button>
               </div>
             )}
@@ -1417,11 +1593,33 @@ export default function AdminPanel() {
       : DEFAULT_TASKS.map((t) => ({ label: t, done: false }));
     const taskDone  = taskList.filter((t) => t.done).length;
     const urgency   = getUrgencyLevel(order);
+    const wasEdited = order.customerEditedAt && (
+      !timeline.length ||
+      new Date(order.customerEditedAt) > new Date(timeline.slice(-1)[0]?.ts || 0)
+    );
     const [deliveryMethod_, setDeliveryMethod_] = useState(order.deliveryMethod || "");
     const [deliveryLink_,   setDeliveryLink_]   = useState(order.deliveryLink || "");
+    const [scrolled, setScrolled] = useState(false);
+    const scrollRef = useRef(null);
+
+    useEffect(() => {
+      const el = scrollRef.current;
+      if (!el) return;
+      const handler = () => setScrolled(el.scrollTop > 80);
+      el.addEventListener("scroll", handler);
+      return () => el.removeEventListener("scroll", handler);
+    }, []);
 
     return (
-      <div style={{ padding: isMobile ? "16px" : "28px 32px", flex: 1, overflowY: "auto", paddingBottom: isMobile ? 80 : undefined }}>
+      <div ref={scrollRef} style={{ padding: isMobile ? "16px" : "28px 32px", flex: 1, overflowY: "auto", paddingBottom: isMobile ? 80 : undefined }}>
+        {scrolled && (
+          <div style={{ position: "sticky", top: 0, zIndex: 50, background: C.ca, borderBottom: `1px solid ${C.bo}`, padding: "10px 20px", display: "flex", alignItems: "center", gap: 10, boxShadow: "0 2px 8px rgba(0,0,0,0.06)", marginLeft: isMobile ? -16 : -32, marginRight: isMobile ? -16 : -32, marginTop: isMobile ? -16 : -28, marginBottom: 16 }}>
+            <span style={{ fontWeight: 900, color: C.pu, fontSize: 14 }}>{order.id}</span>
+            <Badge status={order.status} />
+            <PBadge priority={order.priority} />
+            <span style={{ fontSize: 13, color: C.su, marginLeft: "auto" }}>{order.name}</span>
+          </div>
+        )}
         {/* Back + header */}
         <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 22 }}>
           <div style={{ display: "flex", alignItems: "center", gap: isMobile ? 10 : 14 }}>
@@ -1436,6 +1634,11 @@ export default function AdminPanel() {
                 {urgency && (
                   <span style={{ background: urgency.color + "20", color: urgency.color, padding: "2px 8px", borderRadius: 6, fontSize: 10, fontWeight: 800 }}>
                     {urgency.emoji} {urgency.label}
+                  </span>
+                )}
+                {wasEdited && (
+                  <span style={{ background: "#FFF7ED", color: "#EA580C", fontSize: 10, fontWeight: 800, padding: "2px 8px", borderRadius: 6, border: "1px solid #FED7AA" }}>
+                    ✏️ Customer Edited
                   </span>
                 )}
               </div>
@@ -1497,13 +1700,20 @@ export default function AdminPanel() {
                 <button key={label}
                   onClick={() => {
                     if (status) setStatus(order, status);
-                    else if (label.includes("WhatsApp")) order.whatsapp ? window.open(`https://wa.me/${order.whatsapp.replace(/[^0-9]/g,"")}`) : toast_("No WhatsApp on file");
-                    else if (label.includes("Email")) order.email ? window.open(`mailto:${order.email}`) : toast_("No email on file");
+                    else if (label.includes("WhatsApp")) order.whatsapp ? window.open(`https://wa.me/${order.whatsapp.replace(/[^0-9]/g,"")}?text=${encodeURIComponent(`Hi ${order.name}! This is regarding your Bubu Dudu order ${order.id}. `)}`) : toast_("No WhatsApp on file");
+                    else if (label.includes("Email")) order.email ? window.open(`mailto:${order.email}?subject=${encodeURIComponent(`Regarding your Bubu Dudu order ${order.id}`)}`) : toast_("No email on file");
                   }}
                   style={{ padding: "8px 14px", borderRadius: 8, background: color + "18", color, border: `1px solid ${color}33`, fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: font }}>
                   {label}
                 </button>
               ))}
+              {wasEdited && (
+                <button
+                  onClick={() => { updateOrder(order, { customerEditedAt: null, customerEditNote: "" }); toast_("Edit flag cleared"); }}
+                  style={{ padding: "8px 14px", borderRadius: 8, background: "#FFF7ED", color: "#EA580C", border: "1px solid #FED7AA", fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: font }}>
+                  ✏️ Clear Edit Flag
+                </button>
+              )}
             </div>
           </div>
         )}
@@ -1515,7 +1725,7 @@ export default function AdminPanel() {
             {!isArchived(order) && (
               <Sec title="STATUS & ACTIONS" icon={Settings}>
                 <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
-                  <select value={order.status} onChange={(e) => setStatus(order, e.target.value)}
+                  <select value={sCfg(order.status).key} onChange={(e) => setStatus(order, e.target.value)}
                     style={{ padding: "8px 12px", borderRadius: 8, border: `1px solid ${C.bo}`, fontSize: 12, fontFamily: font, color: C.tx, background: C.in, cursor: "pointer", outline: "none", flex: 1 }}>
                     {STATUSES.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
                   </select>
@@ -1540,9 +1750,9 @@ export default function AdminPanel() {
             }>
               <Row label="Full Name"  value={order.name} />
               <Row label="Country"    value={`${flag(order.country)} ${order.country}`} />
-              <Row label="Email"      value={order.email} />
-              {order.whatsapp  && <Row label="WhatsApp"  value={order.whatsapp} />}
-              {order.instagram && <Row label="Instagram" value={order.instagram} />}
+              <CopyRow label="Email"      value={order.email} />
+              {order.whatsapp  && <CopyRow label="WhatsApp"  value={order.whatsapp} />}
+              {order.instagram && <CopyRow label="Instagram" value={order.instagram} />}
 
               <div style={{ display: "flex", gap: 8, marginBottom: 12, alignItems: "center", flexWrap: "wrap" }}>
                 <span style={{ fontSize: 12, color: C.su, fontWeight: 600, minWidth: isMobile ? 100 : 130 }}>Payment Status</span>
@@ -1573,12 +1783,12 @@ export default function AdminPanel() {
 
               <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
                 {order.email && (
-                  <a href={`mailto:${order.email}`} style={{ padding: "7px 14px", borderRadius: 8, background: "#EFF6FF", color: C.bl, fontSize: 12, fontWeight: 700, textDecoration: "none", display: "flex", alignItems: "center", gap: 5 }}>
+                  <a href={`mailto:${order.email}?subject=${encodeURIComponent(`Regarding your Bubu Dudu order ${order.id}`)}`} style={{ padding: "7px 14px", borderRadius: 8, background: "#EFF6FF", color: C.bl, fontSize: 12, fontWeight: 700, textDecoration: "none", display: "flex", alignItems: "center", gap: 5 }}>
                     <Mail size={12} /> Email
                   </a>
                 )}
                 {order.whatsapp && (
-                  <a href={`https://wa.me/${order.whatsapp.replace(/[^0-9]/g,"")}`} target="_blank" rel="noreferrer" style={{ padding: "7px 14px", borderRadius: 8, background: "#dcfce7", color: "#16A34A", fontSize: 12, fontWeight: 700, textDecoration: "none", display: "flex", alignItems: "center", gap: 5 }}>
+                  <a href={`https://wa.me/${order.whatsapp.replace(/[^0-9]/g,"")}?text=${encodeURIComponent(`Hi ${order.name}! This is regarding your Bubu Dudu order ${order.id}. `)}`} target="_blank" rel="noreferrer" style={{ padding: "7px 14px", borderRadius: 8, background: "#dcfce7", color: "#16A34A", fontSize: 12, fontWeight: 700, textDecoration: "none", display: "flex", alignItems: "center", gap: 5 }}>
                     <MessageCircle size={12} /> WhatsApp
                   </a>
                 )}
@@ -1691,7 +1901,7 @@ export default function AdminPanel() {
                     <div key={i} style={{ position: "relative", marginBottom: 14, paddingLeft: 14 }}>
                       <div style={{ position: "absolute", left: -14, top: 3, width: 10, height: 10, borderRadius: "50%", background: i === 0 ? C.pu : C.bo, border: `2px solid ${C.ca}` }} />
                       <div style={{ fontSize: 12, fontWeight: 700, color: C.tx }}>{item.event}</div>
-                      <div style={{ fontSize: 10, color: C.su, marginTop: 2 }}>{item.ts}</div>
+                      <div style={{ fontSize: 10, color: C.su, marginTop: 2 }}>{item.ts || item.date || "—"}</div>
                     </div>
                   ))}
                   <div style={{ position: "relative", marginBottom: 6, paddingLeft: 14 }}>
@@ -2302,6 +2512,11 @@ export default function AdminPanel() {
                   <div style={{ fontSize: 11, fontWeight: 700, color: C.su, marginBottom: 6 }}>BUSINESS NAME</div>
                   <input value={form.businessName || ""} onChange={e => setForm(f => ({ ...f, businessName: e.target.value }))} style={inpStyle} />
                 </div>
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: C.su, marginBottom: 6 }}>ADMIN WHATSAPP NUMBER</div>
+                  <input value={form.adminWhatsApp || ""} onChange={e => setForm(f => ({ ...f, adminWhatsApp: e.target.value }))} placeholder="919265802481" style={inpStyle} />
+                  <div style={{ fontSize: 11, color: C.su, marginTop: 4 }}>Include country code, no spaces or dashes (e.g. 919265802481).</div>
+                </div>
               </div>
             </Sec>
 
@@ -2578,5 +2793,13 @@ export default function AdminPanel() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function AdminPanel() {
+  return (
+    <ErrorBoundary>
+      <AdminPanelInner />
+    </ErrorBoundary>
   );
 }
