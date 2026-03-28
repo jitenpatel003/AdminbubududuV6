@@ -1,0 +1,37 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /orders/{orderId} {
+      allow create: if
+        request.resource.data.keys().hasAll(['id','name','email','status','createdAt','whatsapp']) &&
+        request.resource.data.status == 'Script Review' &&
+        request.resource.data.id is string &&
+        request.resource.data.name is string &&
+        request.resource.data.email is string &&
+        request.resource.data.whatsapp is string &&
+        request.resource.data.id.size() >= 5;
+
+      allow read: if true;
+
+      allow update: if
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'yourName','partnerName','sceneStyle','referenceLink','referenceText',
+          'scriptText','shortIdea','customerEditedAt','customerEditNote',
+          'rating','review','ratedAt',
+          'status','priority','adminNotesList','tasks','tags','timeline',
+          'deliveryMethod','deliveryLink','deliveredAt','paymentStatus',
+          'archiveReason','pinnedNote','addOnWallpaper','pricingType',
+          'waAlertFailed','deadline','draftReason'
+        ]);
+
+      allow delete: if false;
+    }
+
+    match /settings/{docId} {
+      allow read: if true;
+      allow write: if true;
+      // NOTE: Tighten to authenticated admin only when Firebase Auth is implemented
+    }
+  }
+}

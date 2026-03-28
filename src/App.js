@@ -19,17 +19,18 @@ import {
 import { initializeApp } from "firebase/app";
 import {
   getFirestore, collection, onSnapshot, doc, updateDoc,
-  query, orderBy, addDoc, serverTimestamp, limit, startAfter, getDocs,
+  query, orderBy, addDoc, serverTimestamp, limit, startAfter,
+  getDocs, arrayUnion, setDoc,
 } from "firebase/firestore";
 
 // ── FIREBASE CONFIG ───────────────────────────────────────────
 const firebaseConfig = {
-  apiKey: "AIzaSyBrzaNDH7LY4S_Tm587G8m-M5sZwJojWGg",
-  authDomain: "bubu-dudu-orders.firebaseapp.com",
-  projectId: "bubu-dudu-orders",
-  storageBucket: "bubu-dudu-orders.firebasestorage.app",
-  messagingSenderId: "777698426354",
-  appId: "1:777698426354:web:c2850904fcf0b024dabf6b",
+  apiKey: process.env.REACT_APP_FIREBASE_API_KEY,
+  authDomain: process.env.REACT_APP_FIREBASE_AUTH_DOMAIN,
+  projectId: process.env.REACT_APP_FIREBASE_PROJECT_ID,
+  storageBucket: process.env.REACT_APP_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: process.env.REACT_APP_FIREBASE_MESSAGING_ID,
+  appId: process.env.REACT_APP_FIREBASE_APP_ID,
 };
 const app = initializeApp(firebaseConfig);
 const db  = getFirestore(app);
@@ -220,8 +221,27 @@ function AdminPanelInner() {
   const [authed,  setAuthed]  = useState(() => {
     try { return sessionStorage.getItem("bd_session") === ADMIN_PIN_HASH; } catch { return false; }
   });
+
+  const [darkMode, setDarkMode] = useState(() => {
+    try { return localStorage.getItem("bd_dark_mode") === "true"; } catch { return false; }
+  });
+
+  const C = darkMode ? {
+    pu:"#A78BFA", gr:"#34D399", or:"#FB923C", re:"#F87171", bl:"#60A5FA",
+    ye:"#FBBF24", dg:"#4ADE80", bg:"#0F172A", sb:"#1E293B", sbh:"#334155",
+    ca:"#1E293B", bo:"#334155", tx:"#F1F5F9", su:"#94A3B8", li:"#1E3A5F",
+    th:"#172554", in:"#0F172A",
+  } : {
+    pu:"#6D28D9", gr:"#16A34A", or:"#EA580C", re:"#DC2626", bl:"#2563EB",
+    ye:"#D97706", dg:"#15803D", bg:"#F8F9FC", sb:"#0F172A", sbh:"#1E293B",
+    ca:"#FFFFFF", bo:"#E5E7EB", tx:"#111827", su:"#6B7280", li:"#F3F4F6",
+    th:"#EEF2FF", in:"#FFFFFF",
+  };
   const [pin,     setPin]     = useState("");
   const [pinErr,  setPinErr]  = useState("");
+  const [pinAttempts, setPinAttempts] = useState(0);
+  const [pinLocked, setPinLocked] = useState(false);
+  const [pinLockTimer, setPinLockTimer] = useState(0);
   const lastActivityRef = useRef(Date.now());
   const [orders,  setOrders]  = useState([]);
   const [hasMore, setHasMore] = useState(false);
@@ -267,12 +287,41 @@ function AdminPanelInner() {
   const [fTag,      setFTag]  = useState("All");
   const [search,    setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [searchAllResults, setSearchAllResults] = useState([]);
+  const [isSearchingAll, setIsSearchingAll] = useState(false);
   const [sortK,     setSortK] = useState("date");
   const [sortD,     setSortD] = useState("desc");
   const [filterOpen, setFilterOpen] = useState(false);
 
   useEffect(() => {
-    const timer = setTimeout(() => setDebouncedSearch(search), 300);
+    const timer = setTimeout(async () => {
+      setDebouncedSearch(search);
+      if (search.trim().length >= 3) {
+        const key = search.trim().toLowerCase();
+        if (searchCacheRef.current[key]) {
+          setSearchAllResults(searchCacheRef.current[key]);
+          return;
+        }
+        setIsSearchingAll(true);
+        try {
+          const snap = await getDocs(query(collection(db, "orders"), orderBy("createdAt", "desc")));
+          const terms = key.split(/\s+/);
+          const results = snap.docs.map(d => ({ ...d.data(), _docId: d.id })).filter(o =>
+            terms.every(t =>
+              (o.id || "").toLowerCase().includes(t) ||
+              (o.name || "").toLowerCase().includes(t) ||
+              (o.email || "").toLowerCase().includes(t) ||
+              (o.country || "").toLowerCase().includes(t)
+            )
+          );
+          searchCacheRef.current[key] = results;
+          setSearchAllResults(results);
+        } catch { setSearchAllResults([]); }
+        setIsSearchingAll(false);
+      } else {
+        setSearchAllResults([]);
+      }
+    }, 400);
     return () => clearTimeout(timer);
   }, [search]);
 
@@ -285,6 +334,9 @@ function AdminPanelInner() {
   const [newAlert,  setNewAlert]  = useState(null);
   const [notifOpen, setNotifOpen] = useState(false);
   const [newOrders, setNewOrders] = useState([]);
+  const [digestSent, setDigestSent] = useState(() => {
+    try { return localStorage.getItem("bd_digest_date") === new Date().toISOString().split("T")[0]; } catch { return false; }
+  });
 
   // ── MODALS ────────────────────────────────────────────────
   const [changeModal,      setChangeModal]      = useState(false);
@@ -300,6 +352,7 @@ function AdminPanelInner() {
   // ── CALENDAR ──────────────────────────────────────────────
   const [calYear,  setCalYear]  = useState(new Date().getFullYear());
   const [calMonth, setCalMonth] = useState(new Date().getMonth());
+  const [calView,  setCalView]  = useState("month");
 
   // ── NOTES ─────────────────────────────────────────────────
   const [noteInput, setNoteInput] = useState("");
@@ -311,9 +364,23 @@ function AdminPanelInner() {
   const DEFAULT_SETTINGS = {
     shortPrice: 40, longPrice: 80, maxCapacity: 8, orderIdPrefix: "BD",
     soundEnabled: true,
+    overdueAlertEnabled: true,
     workingHoursStart: "09:00", workingHoursEnd: "20:00",
     adminName: "Admin", businessName: "Bubu Dudu", adminPhoto: "", adminWhatsApp: "919265802481",
     briefingTime: "09:00",
+    monthlyGoal: 500,
+    blockedDates: [],
+    blacklistedEmails: [],
+    blacklistedWhatsapp: [],
+    webhookUrl: "",
+    webhookEnabled: false,
+    quickReplies: [
+      "Your script is ready for review! Please check and let us know. 🎀",
+      "Just a reminder that your payment is due. Thank you! 💳",
+      "Your video preview is ready! Please review and confirm. 🎬",
+      "Your final video has been delivered! We hope you love it. 🎉",
+      "We need your feedback to proceed. Please reply when you get a chance. 📩",
+    ],
     emailTemplates: {
       scriptApproved: { subject: "Your Script Is Approved! 🎬", body: "Hi {name},\n\nGreat news! Your script has been approved and we are now starting the animation.\n\nOrder ID: {orderId}\n\nWe'll send you a preview soon!\n\nBubu Dudu Team" },
       previewReady:   { subject: "Your Preview Is Ready! 👀", body: "Hi {name},\n\nYour video preview is ready for review.\n\nOrder ID: {orderId}\n\nPlease check and let us know if any changes are needed.\n\nBubu Dudu Team" },
@@ -338,14 +405,31 @@ function AdminPanelInner() {
   const [milestoneMsg,     setMilestoneMsg]     = useState("");
 
   const prevCountRef = useRef(0);
+  const overdueAlertedRef = useRef(new Set());
+  const searchCacheRef = useRef({});
   const font = "'Nunito', sans-serif";
   const sh   = "0 1px 8px rgba(0,0,0,0.06)";
   const shMd = "0 4px 20px rgba(0,0,0,0.1)";
 
   const calcRevenue = (o) => {
     const len = (o.length || "").toLowerCase();
-    const isShort = len.includes("40") || len.includes("short");
+    const isShort = len.includes("40") ||
+                    len.includes("short") ||
+                    len.includes("30") ||
+                    len.includes("45");
     return isShort ? settings.shortPrice : settings.longPrice;
+  };
+
+  const calcProfitScore = (order) => {
+    const base = calcRevenue(order);
+    const isEmergency = (order.delivery || "").includes("Emergency");
+    const effectiveRevenue = isEmergency ? base * 1.5 : base;
+    const revisions = (order.timeline || []).filter(e => (e.event || "").includes("Waiting On Customer")).length;
+    const estimatedProfit = effectiveRevenue - (revisions * 5) - 10;
+    const pct = Math.max(0, Math.round(estimatedProfit / effectiveRevenue * 100));
+    const level = pct >= 80 ? "High" : pct >= 50 ? "Medium" : "Low";
+    const color = pct >= 80 ? "#16A34A" : pct >= 50 ? "#D97706" : "#DC2626";
+    return { base, effectiveRevenue, revisions, estimatedProfit, pct, level, color };
   };
 
   const toast_ = (msg) => { setToast(msg); setTimeout(() => setToast(""), 3500); };
@@ -363,9 +447,31 @@ function AdminPanelInner() {
         setNewOrders((p) => [newest, ...p]);
         if (settings.soundEnabled !== false) playBeep();
         setTimeout(() => setNewAlert(null), 8000);
+        if ("Notification" in window && Notification.permission === "granted") {
+          new Notification("New Bubu Dudu Order! 🎀", {
+            body: `${newest.name} from ${newest.country} — ${newest.length}`,
+            icon: "/favicon.ico",
+          });
+        }
+      }
+      if (prevCountRef.current === 0) {
+        const staleCount = data.filter(o => o.status === "Script Review" && !isArchived(o) &&
+          (o.date || "") < new Date(Date.now() - 30 * 86400000).toISOString().split("T")[0]).length;
+        if (staleCount > 0) toast_(`⚠️ ${staleCount} order${staleCount > 1 ? "s" : ""} at Script Review for 30+ days. Check "Stale" tab.`);
       }
       prevCountRef.current = data.length;
       setOrders(data);
+      if (settings.overdueAlertEnabled !== false && process.env.REACT_APP_TEXTMEBOT_KEY) {
+        data.forEach(o => {
+          if (isArchived(o) || o.status === "Completed") return;
+          if (hoursLeft(o.deadline) < 0 && !overdueAlertedRef.current.has(o.id)) {
+            overdueAlertedRef.current.add(o.id);
+            const msg = encodeURIComponent(`🔴 OVERDUE — Order ${o.id} by ${o.name}. Status: ${o.status}. Deadline: ${o.deadline}`);
+            fetch(`https://api.textmebot.com/send.php?recipient=${settings.adminWhatsApp}&apikey=${process.env.REACT_APP_TEXTMEBOT_KEY}&text=${msg}`,
+              { method: "GET", mode: "no-cors" }).catch(() => {});
+          }
+        });
+      }
       setHasMore(snap.docs.length === 100);
       setLastDoc(snap.docs[snap.docs.length - 1] || null);
       setLoading(false);
@@ -377,6 +483,10 @@ function AdminPanelInner() {
     });
     return () => unsub();
   }, [authed]);
+
+  useEffect(() => {
+    searchCacheRef.current = {};
+  }, [orders.length]);
 
   const loadMore = async () => {
     if (!lastDoc) return;
@@ -422,11 +532,100 @@ function AdminPanelInner() {
     return { totalApproved, totalRevenue, inProgress, completed, totalReceived, overdue, urgent };
   }, [orders, settings.shortPrice, settings.longPrice]);
 
+  const analytics = useMemo(() => {
+    const now = new Date();
+    const thisWeekStart = new Date(now);
+    thisWeekStart.setDate(now.getDate() - now.getDay());
+    thisWeekStart.setHours(0, 0, 0, 0);
+    const lastWeekStart = new Date(thisWeekStart);
+    lastWeekStart.setDate(thisWeekStart.getDate() - 7);
+    const thisMonth = now.getMonth(), thisYear = now.getFullYear();
+
+    let thisWeekRev = 0, lastWeekRev = 0, monthRev = 0;
+    const scriptWrite = { write: 0, help: 0 };
+    const langCounts = {};
+    const customerMap = {};
+
+    orders.forEach(o => {
+      const rev = calcRevenue(o);
+      const d = o.date ? new Date(o.date) : null;
+      if (o.status === "Completed" && d) {
+        if (d >= thisWeekStart) thisWeekRev += rev;
+        else if (d >= lastWeekStart) lastWeekRev += rev;
+        if (d.getMonth() === thisMonth && d.getFullYear() === thisYear) monthRev += rev;
+      }
+      if (o.scriptChoice === "write") scriptWrite.write++;
+      else if (o.scriptChoice === "help") scriptWrite.help++;
+      const lang = o.language || "Unknown";
+      langCounts[lang] = (langCounts[lang] || 0) + 1;
+      if (o.email) {
+        if (!customerMap[o.email]) customerMap[o.email] = { name: o.name, email: o.email, count: 0, rev: 0 };
+        customerMap[o.email].count++;
+        customerMap[o.email].rev += rev;
+      }
+    });
+
+    const total = orders.length || 1;
+    const scriptTotal = (scriptWrite.write + scriptWrite.help) || 1;
+    const topCustomers = Object.values(customerMap).filter(c => c.count > 1).sort((a, b) => b.count - a.count).slice(0, 5);
+    const languages = Object.entries(langCounts).sort((a, b) => b[1] - a[1]).map(([lang, count]) => ({ lang, count, pct: Math.round(count / total * 100) }));
+    const weekDiff = thisWeekRev - lastWeekRev;
+    const weekPct = lastWeekRev > 0 ? Math.round(weekDiff / lastWeekRev * 100) : 0;
+    const goalPct = Math.min(100, Math.round(monthRev / (settings.monthlyGoal || 500) * 100));
+
+    // Productivity chart: count status changes per day (last 7 days with activity)
+    const dayCounts = {};
+    orders.forEach(o => {
+      (o.timeline || []).forEach(e => {
+        if (!(e.event || "").startsWith("Status →")) return;
+        const parts = (e.ts || "").match(/(\d{2})\/(\d{2})\/(\d{4})/);
+        if (!parts) return;
+        const key = `${parts[3]}-${parts[2]}-${parts[1]}`;
+        dayCounts[key] = (dayCounts[key] || 0) + 1;
+      });
+    });
+    const productivityDays = Object.entries(dayCounts)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .slice(-7)
+      .map(([date, count]) => {
+        const label = new Date(date + "T00:00:00").toLocaleDateString("en-GB", { day:"2-digit", month:"short" });
+        return { date, label, count };
+      });
+    const maxCount = Math.max(...productivityDays.map(d => d.count), 1);
+    const avgCount = productivityDays.length > 0 ? Math.round(productivityDays.reduce((s,d) => s + d.count, 0) / productivityDays.length) : 0;
+
+    return { thisWeekRev, lastWeekRev, weekDiff, weekPct, monthRev, goalPct, scriptWrite, scriptTotal, topCustomers, languages, productivityDays, maxCount, avgCount };
+  }, [orders, settings.shortPrice, settings.longPrice, settings.monthlyGoal]);
+
+  const weeklyGroups = useMemo(() => {
+    const groups = {};
+    activeOrders.forEach(o => {
+      if (!o.deadline) return;
+      const d = new Date(o.deadline);
+      const weekStart = new Date(d);
+      weekStart.setDate(d.getDate() - d.getDay());
+      const key = weekStart.toISOString().split("T")[0];
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(o);
+    });
+    return Object.entries(groups)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([weekStart, orders]) => ({
+        weekStart,
+        orders: orders.sort((a, b) => (a.deadline || "").localeCompare(b.deadline || "")),
+      }));
+  }, [activeOrders]);
+
   // ── ALL-ORDERS FILTER (Orders page) ───────────────────────
   const filteredAll = useMemo(() => {
+    if (searchAllResults.length > 0 && search.trim().length >= 3) {
+      return searchAllResults;
+    }
     let a = [...orders];
     if (activeOrdersTab === "active") a = a.filter(o => !isArchived(o) && o.status !== "Completed");
     else if (activeOrdersTab === "archived") a = a.filter(isArchived);
+    else if (activeOrdersTab === "stale") a = a.filter(o => o.status === "Script Review" && !isArchived(o) &&
+      (o.date || "") < new Date(Date.now() - 30 * 86400000).toISOString().split("T")[0]);
     if (fStatus   !== "All") a = a.filter((o) => o.status   === fStatus);
     if (fCountry  !== "All") a = a.filter((o) => o.country  === fCountry);
     if (fLanguage !== "All") a = a.filter((o) => o.language === fLanguage);
@@ -456,7 +655,7 @@ function AdminPanelInner() {
       return sortD === "asc" ? (vx < vy ? -1 : vx > vy ? 1 : 0) : (vx > vy ? -1 : vx < vy ? 1 : 0);
     });
     return a;
-  }, [orders, activeOrdersTab, fStatus, fCountry, fLanguage, fLength, fDelivery, fPriority, fTag, debouncedSearch, sortK, sortD]);
+  }, [orders, activeOrdersTab, fStatus, fCountry, fLanguage, fLength, fDelivery, fPriority, fTag, debouncedSearch, sortK, sortD, searchAllResults, search]);
 
   // ── SMART NOTIFICATIONS ───────────────────────────────────
   const smartNotifications = useMemo(() => {
@@ -473,9 +672,21 @@ function AdminPanelInner() {
     });
     activeOrders.forEach(o => {
       const lastEvent = (o.timeline || []).slice(-1)[0];
-      if (lastEvent) {
-        const daysSince = (Date.now() - new Date(lastEvent.ts).getTime()) / 86400000;
-        if (daysSince >= 3) notifs.push({ type: "stalled", order: o, msg: `${o.id} stalled (${Math.floor(daysSince)}d no activity)`, color: "#D97706" });
+      if (lastEvent && lastEvent.ts) {
+        // Parse "DD/MM/YYYY HH:MM" format safely
+        const parts = lastEvent.ts.match(/(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2})/);
+        if (parts) {
+          const parsed = new Date(parts[3], parts[2] - 1, parts[1], parts[4], parts[5]);
+          const daysSince = (Date.now() - parsed.getTime()) / 86400000;
+          if (daysSince >= 3) {
+            notifs.push({
+              type: "stalled",
+              order: o,
+              msg: `${o.id} stalled (${Math.floor(daysSince)}d no activity)`,
+              color: "#D97706",
+            });
+          }
+        }
       }
     });
     return notifs;
@@ -492,6 +703,62 @@ function AdminPanelInner() {
   const order      = orders.find((o) => o.id === selId);
   const customerHistory = order ? orders.filter((o) => o.email === order.email && o.id !== order.id) : [];
 
+  // ── WEBHOOK HELPER ────────────────────────────────────────
+  const fireWebhook = (ord, newStatus) => {
+    if (!settings.webhookEnabled || !settings.webhookUrl) return;
+    fetch(settings.webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        event: "status_changed",
+        orderId: ord.id,
+        newStatus,
+        customerName: ord.name,
+        email: ord.email,
+        country: ord.country,
+        length: ord.length,
+        delivery: ord.delivery,
+        deadline: ord.deadline,
+        timestamp: new Date().toISOString(),
+      }),
+    }).catch(() => {});
+  };
+
+  // ── DAILY DIGEST ──────────────────────────────────────────
+  const sendDailyDigest = async () => {
+    if (!process.env.REACT_APP_TEXTMEBOT_KEY) {
+      toast_("Digest skipped: no API key");
+      return;
+    }
+    const today = new Date().toISOString().split("T")[0];
+    const overdue = activeOrders.filter(o => hoursLeft(o.deadline) < 0).length;
+    const urgent = activeOrders.filter(o => { const h = hoursLeft(o.deadline); return h >= 0 && h <= 48; }).length;
+    const orderLines = activeOrders.slice(0, 10).map(o => `• ${o.id} — ${o.status}`).join("\n");
+    const msg = encodeURIComponent(
+      `📋 Bubu Dudu Daily Digest — ${today}\n\n` +
+      `Active: ${activeOrders.length} | Overdue: ${overdue} | Urgent: ${urgent}\n\n` +
+      `${orderLines}${activeOrders.length > 10 ? `\n...+${activeOrders.length - 10} more` : ""}`
+    );
+    try {
+      await fetch(
+        `https://api.textmebot.com/send.php?recipient=${process.env.REACT_APP_WA_NUMBER}&apikey=${process.env.REACT_APP_TEXTMEBOT_KEY}&text=${msg}`,
+        { method: "GET", mode: "no-cors" }
+      );
+      localStorage.setItem("bd_digest_date", today);
+      setDigestSent(true);
+      toast_("Daily digest sent!");
+    } catch { toast_("Digest send failed"); }
+  };
+
+  useEffect(() => {
+    if (!authed || orders.length === 0 || digestSent) return;
+    const [hStr, mStr] = (settings.briefingTime || "09:00").split(":");
+    const now = new Date();
+    if (now.getHours() > parseInt(hStr) || (now.getHours() === parseInt(hStr) && now.getMinutes() >= parseInt(mStr))) {
+      sendDailyDigest();
+    }
+  }, [authed, orders.length]);
+
   // ── UPDATE HELPERS ────────────────────────────────────────
   const updateOrder = async (ord, changes) => {
     if (!ord._docId) return;
@@ -500,11 +767,11 @@ function AdminPanelInner() {
   };
 
   const setStatus = async (ord, s) => {
-    const prevTimeline = ord.timeline || [];
     const entry = { event: `Status → ${s}`, ts: fmtTS() };
     try {
-      await updateOrder(ord, { status: s, timeline: [...prevTimeline, entry] });
+      await updateOrder(ord, { status: s, timeline: arrayUnion(entry) });
       toast_(`Status updated: ${s}`);
+      fireWebhook(ord, s);
       if (s === "Completed") {
         setShowConfetti(true);
         setTimeout(() => setShowConfetti(false), 3000);
@@ -522,10 +789,9 @@ function AdminPanelInner() {
   };
 
   const setPri = async (ord, p) => {
-    const prevTimeline = ord.timeline || [];
     const entry = { event: `Priority → ${p}`, ts: fmtTS() };
     try {
-      await updateOrder(ord, { priority: p, timeline: [...prevTimeline, entry] });
+      await updateOrder(ord, { priority: p, timeline: arrayUnion(entry) });
       toast_(`Priority updated: ${p}`);
     } catch (e) {
       toast_("Failed to update priority — check connection");
@@ -536,10 +802,9 @@ function AdminPanelInner() {
     if (!noteInput.trim()) return;
     const prev = ord.adminNotesList || [];
     const newNote = { text: noteInput.trim(), ts: fmtTS() };
-    const prevTimeline = ord.timeline || [];
     const entry = { event: `Note added`, ts: fmtTS() };
     try {
-      await updateOrder(ord, { adminNotesList: [...prev, newNote], timeline: [...prevTimeline, entry] });
+      await updateOrder(ord, { adminNotesList: [...prev, newNote], timeline: arrayUnion(entry) });
       setNoteInput("");
       toast_("Note saved");
     } catch (e) {
@@ -567,12 +832,11 @@ function AdminPanelInner() {
 
   const confirmMoveToArchive = async () => {
     if (!pendingArchiveOrd) return;
-    const prevTimeline = pendingArchiveOrd.timeline || [];
     const entry = { event: `Archived: ${archiveReasonSel}`, ts: fmtTS() };
     await updateOrder(pendingArchiveOrd, {
       status: "Archived",
       archiveReason: archiveReasonSel,
-      timeline: [...prevTimeline, entry],
+      timeline: arrayUnion(entry),
     });
     toast_(`Archived: ${archiveReasonSel}`);
     setArchiveReasonModal(false);
@@ -581,9 +845,8 @@ function AdminPanelInner() {
   };
 
   const restoreFromArchive = async (ord) => {
-    const prevTimeline = ord.timeline || [];
     const entry = { event: `Restored from Archive`, ts: fmtTS() };
-    await updateOrder(ord, { status: "Script Review", archiveReason: "", timeline: [...prevTimeline, entry] });
+    await updateOrder(ord, { status: "Script Review", archiveReason: "", timeline: arrayUnion(entry) });
     toast_("Restored to active");
   };
 
@@ -614,23 +877,21 @@ function AdminPanelInner() {
   };
 
   const bulkMarkCompleted = async () => {
-    let successCount = 0;
-    let failCount = 0;
-    for (const id of selectedIds) {
-      const ord = orders.find((o) => o.id === id);
-      if (ord) {
-        try {
-          await setStatus(ord, "Completed");
-          successCount++;
-        } catch (e) {
-          failCount++;
-        }
-      }
-    }
-    if (failCount > 0) {
-      toast_(`${successCount} updated · ${failCount} failed — check connection`);
+    const targets = [...selectedIds]
+      .map(id => orders.find(o => o.id === id))
+      .filter(Boolean);
+
+    const results = await Promise.allSettled(
+      targets.map(ord => setStatus(ord, "Completed"))
+    );
+
+    const succeeded = results.filter(r => r.status === "fulfilled").length;
+    const failed = results.filter(r => r.status === "rejected").length;
+
+    if (failed > 0) {
+      toast_(`${succeeded} updated · ${failed} failed — check connection`);
     } else {
-      toast_(`${successCount} orders marked completed`);
+      toast_(`${succeeded} orders marked completed`);
     }
     setSelectedIds(new Set());
     setBulkMode(false);
@@ -755,12 +1016,36 @@ function AdminPanelInner() {
 
   // ── LOGIN ─────────────────────────────────────────────────
   const handleLogin = async () => {
+    if (pinLocked) return;
     const entered = await hashPin(pin);
     if (entered === ADMIN_PIN_HASH) {
       setAuthed(true);
+      setPinAttempts(0);
       sessionStorage.setItem("bd_session", entered);
+      if ("Notification" in window && Notification.permission === "default") {
+        Notification.requestPermission();
+      }
     } else {
-      setPinErr("Incorrect PIN. Try again.");
+      const newAttempts = pinAttempts + 1;
+      setPinAttempts(newAttempts);
+      if (newAttempts >= 5) {
+        setPinLocked(true);
+        let secs = 30;
+        setPinLockTimer(secs);
+        const countdown = setInterval(() => {
+          secs -= 1;
+          setPinLockTimer(secs);
+          if (secs <= 0) {
+            clearInterval(countdown);
+            setPinLocked(false);
+            setPinAttempts(0);
+            setPinLockTimer(0);
+          }
+        }, 1000);
+        setPinErr("Too many attempts. Wait 30 seconds.");
+      } else {
+        setPinErr(`Incorrect PIN. ${5 - newAttempts} attempt${5 - newAttempts === 1 ? "" : "s"} remaining.`);
+      }
     }
   };
 
@@ -780,8 +1065,13 @@ function AdminPanelInner() {
             style={{ width: "100%", padding: "13px 16px", borderRadius: 10, border: `1.5px solid ${pinErr ? "#DC2626" : "#334155"}`, fontSize: 16, fontFamily: font, color: "#F1F5F9", background: "#0F172A", outline: "none", boxSizing: "border-box", textAlign: "center", letterSpacing: 8 }} />
           {pinErr && <div style={{ fontSize: 12, color: "#F87171", marginTop: 6, fontWeight: 600 }}>{pinErr}</div>}
         </div>
-        <button onClick={handleLogin}
-          style={{ width: "100%", padding: 13, borderRadius: 10, background: "#6D28D9", color: "#fff", border: "none", fontSize: 15, fontWeight: 800, cursor: "pointer", fontFamily: font, marginTop: 8 }}>
+        {pinLocked && (
+          <div style={{ fontSize: 13, color: "#F87171", fontWeight: 700, marginBottom: 8, textAlign: "center" }}>
+            🔒 Locked. Try again in {pinLockTimer}s
+          </div>
+        )}
+        <button onClick={handleLogin} disabled={pinLocked}
+          style={{ width: "100%", padding: 13, borderRadius: 10, background: "#6D28D9", color: "#fff", border: "none", fontSize: 15, fontWeight: 800, cursor: pinLocked ? "not-allowed" : "pointer", fontFamily: font, marginTop: 8, opacity: pinLocked ? 0.5 : 1 }}>
           Enter Admin Panel
         </button>
       </div>
@@ -868,6 +1158,17 @@ function AdminPanelInner() {
       </div>
 
       <div style={{ padding: "14px 10px", borderTop: "1px solid #1E293B" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "4px 8px", marginBottom: 6 }}>
+          <button onClick={() => {
+            const next = !darkMode;
+            setDarkMode(next);
+            try { localStorage.setItem("bd_dark_mode", String(next)); } catch {}
+          }} style={{ background:"none", border:`1px solid #334155`, borderRadius:8,
+            padding:"5px 10px", cursor:"pointer", color:"#94A3B8", fontSize:15 }}
+            title="Toggle dark mode">
+            {darkMode ? "☀️" : "🌙"}
+          </button>
+        </div>
         <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 8px" }}>
           <div style={{ width: 6, height: 6, borderRadius: "50%", background: syncStatus === "live" ? "#4ADE80" : syncStatus === "error" ? "#F87171" : "#FCD34D" }} />
           <span style={{ fontSize: 10, color: "#64748B" }}>
@@ -1013,11 +1314,17 @@ function AdminPanelInner() {
           </button>
         </div>
 
+        <button onClick={sendDailyDigest} disabled={digestSent}
+          style={{ padding:"6px 14px", background: digestSent ? C.su : C.gr, color:"#fff",
+            border:"none", borderRadius:8, cursor: digestSent ? "default" : "pointer",
+            fontWeight:700, fontSize:13, marginBottom:12 }}>
+          {digestSent ? "📱 Digest Sent ✓" : "📱 Send Daily Digest"}
+        </button>
+
         {/* Stats Widgets */}
         <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr 1fr" : "repeat(5,1fr)", gap: 12, marginBottom: 24 }}>
           {[
             { label: "Total Approved",    value: stats.totalApproved, color: C.pu, bg: "#EDE9FE", emoji: "📋" },
-            { label: "Total Revenue",     value: `$${stats.totalRevenue}`, color: C.gr, bg: "#F0FDF4", emoji: "💰" },
             { label: "In Progress",       value: stats.inProgress, color: C.or, bg: "#FFF7ED", emoji: "⚙️" },
             { label: "Completed",         value: stats.completed,  color: C.dg, bg: "#F0FDF4", emoji: "✅" },
             { label: "Total Received",    value: stats.totalReceived, color: C.bl, bg: "#EFF6FF", emoji: "📥" },
@@ -1028,6 +1335,30 @@ function AdminPanelInner() {
               <div style={{ fontSize: 11, color: C.su, fontWeight: 600, marginTop: 2 }}>{label}</div>
             </div>
           ))}
+          {/* Total Revenue card with monthly goal bar */}
+          <div style={{ background: C.ca, borderRadius: 12, padding: "14px 16px", border: `1px solid ${C.bo}`, boxShadow: sh }}>
+            <div style={{ fontSize: 18, marginBottom: 6 }}>💰</div>
+            <div style={{ fontSize: isMobile ? 20 : 24, fontWeight: 900, color: C.gr }}>${stats.totalRevenue}</div>
+            <div style={{ fontSize: 11, color: C.su, fontWeight: 600, marginTop: 2 }}>Total Revenue</div>
+            {/* Monthly goal bar */}
+            {(() => {
+              const goal = settings.monthlyGoal || 500;
+              const goalPct = analytics.goalPct;
+              const barColor = goalPct >= 100 ? C.gr : goalPct >= 75 ? C.or : goalPct >= 50 ? C.ye : C.pu;
+              return (
+                <div style={{ marginTop:8 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, color:C.su, marginBottom:3 }}>
+                    <span>Monthly Goal</span>
+                    <span>{goalPct}% of ${goal}</span>
+                  </div>
+                  <div style={{ background:C.bo, borderRadius:6, height:6, overflow:"hidden" }}>
+                    <div style={{ width:`${goalPct}%`, background:barColor, height:"100%", borderRadius:6, transition:"width 0.4s" }} />
+                  </div>
+                  {goalPct >= 100 && <div style={{ fontSize:11, color:C.gr, fontWeight:700, marginTop:3, textAlign:"center" }}>🎉 Monthly goal reached!</div>}
+                </div>
+              );
+            })()}
+          </div>
         </div>
 
         {/* Capacity indicator */}
@@ -1060,6 +1391,31 @@ function AdminPanelInner() {
             {stats.urgent  > 0 && <span style={{ fontSize: 13, fontWeight: 700, color: C.or }}>🔥 {stats.urgent} urgent (&lt;48h)</span>}
           </div>
         )}
+
+        {/* Week vs Last Week */}
+        <div style={{ background:C.ca, borderRadius:14, padding:"14px 18px", marginBottom:14, border:`1px solid ${C.bo}` }}>
+          <div style={{ fontSize:11, fontWeight:800, color:C.su, letterSpacing:0.5, marginBottom:8 }}>📈 WEEK vs LAST WEEK</div>
+          <div style={{ display:"flex", gap:16, alignItems:"flex-end" }}>
+            <div>
+              <div style={{ fontSize:10, color:C.su, marginBottom:2 }}>This Week</div>
+              <div style={{ fontSize:22, fontWeight:900, color:C.tx }}>${analytics.thisWeekRev}</div>
+            </div>
+            <div>
+              <div style={{ fontSize:10, color:C.su, marginBottom:2 }}>Last Week</div>
+              <div style={{ fontSize:22, fontWeight:900, color:C.su }}>${analytics.lastWeekRev}</div>
+            </div>
+            <div style={{ marginLeft:"auto", textAlign:"right" }}>
+              <div style={{ fontSize:18, fontWeight:900, color: analytics.weekDiff >= 0 ? C.gr : C.re }}>
+                {analytics.weekDiff >= 0 ? "▲" : "▼"} ${Math.abs(analytics.weekDiff)}
+              </div>
+              {analytics.lastWeekRev > 0 && (
+                <div style={{ fontSize:12, color: analytics.weekDiff >= 0 ? C.gr : C.re, fontWeight:700 }}>
+                  {analytics.weekPct >= 0 ? "+" : ""}{analytics.weekPct}%
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
 
         {/* Active Orders Table — no mail buttons, approved only */}
         <div style={{ background: C.ca, borderRadius: 14, border: `1px solid ${C.bo}`, boxShadow: sh, overflow: "hidden" }}>
@@ -1180,13 +1536,19 @@ function AdminPanelInner() {
         </div>
 
         {/* Tab selector */}
-        <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+        <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
           {[["active","Active Orders"],["archived","Archived"]].map(([tab, label]) => (
             <button key={tab} onClick={() => setActiveOrdersTab(tab)}
               style={{ padding: "8px 20px", borderRadius: 8, background: activeOrdersTab === tab ? C.pu : C.ca, color: activeOrdersTab === tab ? "#fff" : C.su, border: `1px solid ${activeOrdersTab === tab ? C.pu : C.bo}`, fontSize: 13, fontWeight: 700, cursor: "pointer", fontFamily: font }}>
               {label} {tab === "active" ? `(${activeOrders.length})` : `(${archivedOrders.length})`}
             </button>
           ))}
+          <button onClick={() => setActiveOrdersTab("stale")}
+            style={{ padding:"5px 12px", borderRadius:20, fontSize:12, fontWeight:700, cursor:"pointer",
+              border:"none", background: activeOrdersTab==="stale" ? C.or : C.li,
+              color: activeOrdersTab==="stale" ? "#fff" : C.su }}>
+            🕰️ Stale
+          </button>
         </div>
 
         {/* Search + filters (desktop) */}
@@ -1234,6 +1596,15 @@ function AdminPanelInner() {
             <span style={{ fontSize: 13, fontWeight: 700, color: C.pu }}>{selectedIds.size} selected</span>
             <button onClick={bulkMarkCompleted} style={{ padding: "6px 14px", borderRadius: 6, background: C.gr, color: "#fff", border: "none", fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: font }}>Mark Completed</button>
             <button onClick={() => { setSelectedIds(new Set()); setBulkMode(false); }} style={{ padding: "6px 14px", borderRadius: 6, background: C.li, border: `1px solid ${C.bo}`, color: C.su, fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: font }}>Cancel</button>
+          </div>
+        )}
+
+        {isSearchingAll && (
+          <div style={{ textAlign:"center", padding:"8px", fontSize:13, color:C.su }}>🔍 Searching all orders...</div>
+        )}
+        {searchAllResults.length > 0 && search.trim().length >= 3 && (
+          <div style={{ background:C.th, borderRadius:8, padding:"6px 14px", marginBottom:8, fontSize:12, color:C.pu, fontWeight:700 }}>
+            🔍 {searchAllResults.length} results across all orders
           </div>
         )}
 
@@ -1480,59 +1851,101 @@ function AdminPanelInner() {
           </div>
         </div>
 
-        <div style={{ background: C.ca, borderRadius: 14, border: `1px solid ${C.bo}`, overflow: "hidden", boxShadow: sh }}>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(7,1fr)", borderBottom: `1px solid ${C.bo}` }}>
-            {["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map((d) => (
-              <div key={d} style={{ textAlign: "center", fontSize: isMobile ? 9 : 11, fontWeight: 700, color: C.su, padding: isMobile ? "8px 0" : "12px 0", background: C.li }}>
-                {isMobile ? d.charAt(0) : d}
+        <div style={{ display:"flex", gap:8, marginBottom:12 }}>
+          <button onClick={() => setCalView("month")}
+            style={{ padding:"5px 14px", borderRadius:8, border:`1px solid ${C.bo}`, cursor:"pointer", fontWeight:700,
+              background: calView==="month" ? C.pu : C.in, color: calView==="month" ? "#fff" : C.su, fontSize:13 }}>
+            📅 Month
+          </button>
+          <button onClick={() => setCalView("week")}
+            style={{ padding:"5px 14px", borderRadius:8, border:`1px solid ${C.bo}`, cursor:"pointer", fontWeight:700,
+              background: calView==="week" ? C.pu : C.in, color: calView==="week" ? "#fff" : C.su, fontSize:13 }}>
+            📋 Week
+          </button>
+        </div>
+
+        {calView === "month" && (
+          <>
+            <div style={{ background: C.ca, borderRadius: 14, border: `1px solid ${C.bo}`, overflow: "hidden", boxShadow: sh }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(7,1fr)", borderBottom: `1px solid ${C.bo}` }}>
+                {["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map((d) => (
+                  <div key={d} style={{ textAlign: "center", fontSize: isMobile ? 9 : 11, fontWeight: 700, color: C.su, padding: isMobile ? "8px 0" : "12px 0", background: C.li }}>
+                    {isMobile ? d.charAt(0) : d}
+                  </div>
+                ))}
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(7,1fr)" }}>
+                {cells.map((day, i) => {
+                  const isToday = day && day === todayDate && calMonth === todayMon && calYear === todayYr;
+                  const dos = day ? (byDay[day] || []) : [];
+                  return (
+                    <div key={i}
+                      onClick={() => day && dos.length > 0 && setCalSheet({ day, orders: dos })}
+                      style={{ borderRight: (i + 1) % 7 !== 0 ? `1px solid ${C.bo}` : "none", borderBottom: `1px solid ${C.bo}`, minHeight: isMobile ? 50 : 80, padding: isMobile ? 4 : 8, background: isToday ? "#F5F3FF" : C.ca, cursor: day && dos.length > 0 ? "pointer" : "default" }}
+                      onMouseEnter={(e) => { if (day && dos.length > 0) e.currentTarget.style.background = "#F5F3FF"; }}
+                      onMouseLeave={(e) => { if (day) e.currentTarget.style.background = isToday ? "#F5F3FF" : C.ca; }}>
+                      {day && (
+                        <>
+                          <div style={{ fontSize: isMobile ? 10 : 13, fontWeight: isToday ? 900 : 600, color: isToday ? C.pu : C.tx, background: isToday ? "#EDE9FE" : "transparent", width: isMobile ? 18 : 24, height: isMobile ? 18 : 24, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center" }}>{day}</div>
+                          {dos.length > 0 && (
+                            <div style={{ marginTop: isMobile ? 2 : 6 }}>
+                              {!isMobile && dos.slice(0, 2).map((o) => (
+                                <div key={o.id} style={{ fontSize: 9, color: dlCol(o.deadline), fontWeight: 700, marginBottom: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                  {o.name} · {o.length?.includes("40") ? "Short" : "Long"}
+                                </div>
+                              ))}
+                              {!isMobile && dos.length > 2 && <div style={{ fontSize: 8, color: C.su, fontWeight: 700 }}>+{dos.length - 2} more</div>}
+                              {isMobile && (
+                                <div style={{ display: "flex", gap: 2, flexWrap: "wrap" }}>
+                                  {dos.slice(0, 3).map((o) => (
+                                    <div key={o.id} style={{ width: 5, height: 5, borderRadius: "50%", background: dlCol(o.deadline) }} />
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div style={{ display: "flex", gap: 16, marginTop: 14, flexWrap: "wrap" }}>
+              {[["#DC2626","Overdue"],["#EA580C","< 48h"],["#D97706","< 1 week"],["#16A34A","On track"]].map(([col, lbl]) => (
+                <div key={lbl} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: C.su }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: col }} /> {lbl}
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
+        {calView === "week" && (
+          <div>
+            {weeklyGroups.length === 0 && (
+              <div style={{ textAlign:"center", color:C.su, padding:40, fontSize:14 }}>No active orders with deadlines.</div>
+            )}
+            {weeklyGroups.map(({ weekStart, orders: wOrders }) => (
+              <div key={weekStart} style={{ marginBottom:16 }}>
+                <div style={{ fontSize:11, fontWeight:800, color:C.su, letterSpacing:0.5, marginBottom:8 }}>
+                  WEEK OF {new Date(weekStart + "T00:00:00").toLocaleDateString("en-GB", { day:"2-digit", month:"short", year:"numeric" })}
+                </div>
+                {wOrders.map(o => (
+                  <div key={o.id} onClick={() => { setSelId(o.id); setPage("detail"); }}
+                    style={{ display:"flex", alignItems:"center", gap:8, padding:"8px 10px",
+                      background:C.ca, borderRadius:10, marginBottom:6, border:`1px solid ${C.bo}`,
+                      cursor:"pointer" }}>
+                    <span style={{ fontSize:11, fontWeight:700, color:dlCol(o.deadline), minWidth:60 }}>{smartDL(o.deadline)}</span>
+                    <span style={{ fontSize:12, fontWeight:700, color:C.tx, flex:1 }}>{o.name}</span>
+                    <span style={{ fontSize:11, color:C.su }}>{o.id}</span>
+                  </div>
+                ))}
               </div>
             ))}
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(7,1fr)" }}>
-            {cells.map((day, i) => {
-              const isToday = day && day === todayDate && calMonth === todayMon && calYear === todayYr;
-              const dos = day ? (byDay[day] || []) : [];
-              return (
-                <div key={i}
-                  onClick={() => day && dos.length > 0 && setCalSheet({ day, orders: dos })}
-                  style={{ borderRight: (i + 1) % 7 !== 0 ? `1px solid ${C.bo}` : "none", borderBottom: `1px solid ${C.bo}`, minHeight: isMobile ? 50 : 80, padding: isMobile ? 4 : 8, background: isToday ? "#F5F3FF" : C.ca, cursor: day && dos.length > 0 ? "pointer" : "default" }}
-                  onMouseEnter={(e) => { if (day && dos.length > 0) e.currentTarget.style.background = "#F5F3FF"; }}
-                  onMouseLeave={(e) => { if (day) e.currentTarget.style.background = isToday ? "#F5F3FF" : C.ca; }}>
-                  {day && (
-                    <>
-                      <div style={{ fontSize: isMobile ? 10 : 13, fontWeight: isToday ? 900 : 600, color: isToday ? C.pu : C.tx, background: isToday ? "#EDE9FE" : "transparent", width: isMobile ? 18 : 24, height: isMobile ? 18 : 24, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center" }}>{day}</div>
-                      {dos.length > 0 && (
-                        <div style={{ marginTop: isMobile ? 2 : 6 }}>
-                          {!isMobile && dos.slice(0, 2).map((o) => (
-                            <div key={o.id} style={{ fontSize: 9, color: dlCol(o.deadline), fontWeight: 700, marginBottom: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                              {o.name} · {o.length?.includes("40") ? "Short" : "Long"}
-                            </div>
-                          ))}
-                          {!isMobile && dos.length > 2 && <div style={{ fontSize: 8, color: C.su, fontWeight: 700 }}>+{dos.length - 2} more</div>}
-                          {isMobile && (
-                            <div style={{ display: "flex", gap: 2, flexWrap: "wrap" }}>
-                              {dos.slice(0, 3).map((o) => (
-                                <div key={o.id} style={{ width: 5, height: 5, borderRadius: "50%", background: dlCol(o.deadline) }} />
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-
-        <div style={{ display: "flex", gap: 16, marginTop: 14, flexWrap: "wrap" }}>
-          {[["#DC2626","Overdue"],["#EA580C","< 48h"],["#D97706","< 1 week"],["#16A34A","On track"]].map(([col, lbl]) => (
-            <div key={lbl} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: C.su }}>
-              <div style={{ width: 8, height: 8, borderRadius: "50%", background: col }} /> {lbl}
-            </div>
-          ))}
-        </div>
+        )}
 
         {/* Calendar sheet modal */}
         {calSheet && (
@@ -1600,7 +2013,13 @@ function AdminPanelInner() {
     const [deliveryMethod_, setDeliveryMethod_] = useState(order.deliveryMethod || "");
     const [deliveryLink_,   setDeliveryLink_]   = useState(order.deliveryLink || "");
     const [scrolled, setScrolled] = useState(false);
+    const [scriptRaw, setScriptRaw] = useState(false);
+    const [pinInput, setPinInput] = useState("");
+    const [editDL, setEditDL] = useState(false);
+    const [dlInput, setDlInput] = useState(order.deadline||"");
+    const [qrOpen, setQrOpen] = useState(false);
     const scrollRef = useRef(null);
+    const stickyRef = useRef(null);
 
     useEffect(() => {
       const el = scrollRef.current;
@@ -1610,8 +2029,27 @@ function AdminPanelInner() {
       return () => el.removeEventListener("scroll", handler);
     }, []);
 
+    useEffect(() => {
+      const onScroll = () => {
+        if (stickyRef.current) {
+          stickyRef.current.style.display = window.scrollY > 80 ? "flex" : "none";
+        }
+      };
+      window.addEventListener("scroll", onScroll, { passive: true });
+      return () => window.removeEventListener("scroll", onScroll);
+    }, []);
+
     return (
       <div ref={scrollRef} style={{ padding: isMobile ? "16px" : "28px 32px", flex: 1, overflowY: "auto", paddingBottom: isMobile ? 80 : undefined }}>
+        <div ref={stickyRef} style={{ display:"none", position:"fixed", top:0, left:0, right:0,
+          zIndex:200, background:C.ca, borderBottom:`1px solid ${C.bo}`,
+          padding:"8px 16px", alignItems:"center", gap:10, boxShadow:"0 2px 8px rgba(0,0,0,0.1)" }}>
+          <button onClick={() => setPage("orders")} style={{ background:"none", border:"none", cursor:"pointer", color:C.su }}>
+            <ArrowLeft size={16} />
+          </button>
+          <span style={{ fontWeight:900, color:C.pu, fontSize:13 }}>{order.id}</span>
+          <span style={{ fontSize:12, color:C.su, marginLeft:"auto" }}>{order.name}</span>
+        </div>
         {scrolled && (
           <div style={{ position: "sticky", top: 0, zIndex: 50, background: C.ca, borderBottom: `1px solid ${C.bo}`, padding: "10px 20px", display: "flex", alignItems: "center", gap: 10, boxShadow: "0 2px 8px rgba(0,0,0,0.06)", marginLeft: isMobile ? -16 : -32, marginRight: isMobile ? -16 : -32, marginTop: isMobile ? -16 : -28, marginBottom: 16 }}>
             <span style={{ fontWeight: 900, color: C.pu, fontSize: 14 }}>{order.id}</span>
@@ -1620,6 +2058,17 @@ function AdminPanelInner() {
             <span style={{ fontSize: 13, color: C.su, marginLeft: "auto" }}>{order.name}</span>
           </div>
         )}
+
+        {order.pinnedNote && (
+          <div style={{ background:"#FEFCE8", border:"2px solid #FCD34D", borderRadius:12,
+            padding:"10px 14px", marginBottom:14, display:"flex", alignItems:"flex-start", gap:8 }}>
+            <span style={{ fontSize:18 }}>📌</span>
+            <div style={{ flex:1, fontSize:13, color:"#92400E", fontWeight:600, lineHeight:1.5 }}>{order.pinnedNote}</div>
+            <button onClick={() => updateOrder(order, { pinnedNote: "" })}
+              style={{ background:"none", border:"none", cursor:"pointer", color:"#92400E", fontWeight:700, fontSize:15, padding:0 }}>×</button>
+          </div>
+        )}
+
         {/* Back + header */}
         <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 22 }}>
           <div style={{ display: "flex", alignItems: "center", gap: isMobile ? 10 : 14 }}>
@@ -1639,6 +2088,12 @@ function AdminPanelInner() {
                 {wasEdited && (
                   <span style={{ background: "#FFF7ED", color: "#EA580C", fontSize: 10, fontWeight: 800, padding: "2px 8px", borderRadius: 6, border: "1px solid #FED7AA" }}>
                     ✏️ Customer Edited
+                  </span>
+                )}
+                {order.addOnWallpaper && (
+                  <span style={{ background:"#EDE9FE", color:"#6D28D9", fontSize:11, fontWeight:800,
+                    padding:"3px 8px", borderRadius:6, display:"inline-flex", alignItems:"center", gap:3 }}>
+                    🖼️ Add-On: Custom Wallpaper (+$5)
                   </span>
                 )}
               </div>
@@ -1684,6 +2139,17 @@ function AdminPanelInner() {
           </div>
         )}
 
+        {/* WA Alert Failed Warning */}
+        {order.waAlertFailed && (
+          <div style={{
+            background: "#FEF2F2", border: "1px solid #FECACA",
+            borderRadius: 8, padding: "8px 12px", marginBottom: 10,
+            fontSize: 12, color: "#DC2626", fontWeight: 700,
+          }}>
+            ⚠️ WhatsApp alert failed on submission. Customer may not have been notified.
+          </div>
+        )}
+
         {/* Quick Actions */}
         {!isArchived(order) && (
           <div style={{ background: C.ca, borderRadius: 12, border: `1px solid ${C.bo}`, padding: "14px 18px", marginBottom: 14, boxShadow: sh }}>
@@ -1717,6 +2183,28 @@ function AdminPanelInner() {
             </div>
           </div>
         )}
+
+        {/* Profitability Score */}
+        {!isArchived(order) && order.status !== "Script Review" && (() => {
+          const ps = calcProfitScore(order);
+          return (
+            <div style={{ background:C.ca, borderRadius:14, padding:"12px 16px", marginBottom:12, border:`1px solid ${C.bo}` }}>
+              <div style={{ fontSize:11, fontWeight:800, color:C.su, letterSpacing:0.5, marginBottom:8 }}>💰 PROFITABILITY SCORE</div>
+              <div style={{ display:"flex", gap:12, flexWrap:"wrap", alignItems:"center" }}>
+                <div style={{ background:ps.color+"22", borderRadius:8, padding:"4px 10px", display:"inline-flex", alignItems:"center", gap:4 }}>
+                  <span style={{ fontWeight:900, color:ps.color, fontSize:15 }}>{ps.pct}%</span>
+                  <span style={{ fontWeight:700, color:ps.color, fontSize:12 }}>{ps.level}</span>
+                </div>
+                <div style={{ fontSize:12, color:C.su }}>
+                  Base: <strong style={{ color:C.tx }}>${ps.base}</strong>
+                  {ps.revisions > 0 && <span> · Revisions: <strong style={{ color:C.re }}>-${ps.revisions * 5}</strong></span>}
+                  {(order.delivery || "").includes("Emergency") && <span> · Emergency: <strong style={{ color:C.gr }}>×1.5</strong></span>}
+                  {' '}· Est. profit: <strong style={{ color:C.gr }}>${ps.estimatedProfit}</strong>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
 
         {/* Two-column layout */}
         <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: 14 }}>
@@ -1753,6 +2241,65 @@ function AdminPanelInner() {
               <CopyRow label="Email"      value={order.email} />
               {order.whatsapp  && <CopyRow label="WhatsApp"  value={order.whatsapp} />}
               {order.instagram && <CopyRow label="Instagram" value={order.instagram} />}
+
+              <div style={{ display:"flex", gap:12, marginBottom:9, alignItems:"center" }}>
+                <span style={{ fontSize:12, color:C.su, fontWeight:600, minWidth:130 }}>Portal Link</span>
+                <span style={{ fontSize:12, color:C.bl, flex:1, wordBreak:"break-all" }}>
+                  {`https://bubududucustom.com/?order=${order.id}`}
+                </span>
+                <button onClick={() => navigator.clipboard.writeText(
+                  `https://bubududucustom.com/?order=${order.id}`
+                ).then(() => toast_("Link copied!"))}
+                  style={{ background:"none", border:"none", cursor:"pointer", color:C.su, flexShrink:0 }}>
+                  <Copy size={13} />
+                </button>
+              </div>
+
+              {order.whatsapp && (
+                <div style={{ marginTop:10 }}>
+                  <div style={{ fontSize:11, fontWeight:700, color:C.su, marginBottom:6 }}>WHATSAPP TEMPLATES</div>
+                  <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                    {[
+                      { label:"Script Ready", msg:`Hi ${order.name}! 👋 Your script for order *${order.id}* is ready for review. Please check and let us know your thoughts! — Bubu Dudu Team 🎀` },
+                      { label:"Preview Sent", msg:`Hi ${order.name}! 🎬 Your video preview for order *${order.id}* has been sent. Please review and confirm! — Bubu Dudu Team 🎀` },
+                      { label:"Payment Due", msg:`Hi ${order.name}! 💳 A payment is due for your Bubu Dudu order *${order.id}*. Please complete payment to continue. Thank you! — Bubu Dudu Team 🎀` },
+                      { label:"Delivered", msg:`Hi ${order.name}! 🎉 Your custom video for order *${order.id}* has been delivered! We hope you love it. Thank you for choosing Bubu Dudu! 🐾` + (order.deliveryLink ? `\n\n📥 Download: ${order.deliveryLink}` : "") },
+                    ].map(t => (
+                      <a key={t.label}
+                        href={`https://wa.me/${(order.whatsapp||"").replace(/[^0-9]/g,"")}?text=${encodeURIComponent(t.msg)}`}
+                        target="_blank" rel="noopener noreferrer"
+                        style={{ padding:"4px 10px", background:"#25D366", color:"#fff", borderRadius:6,
+                          fontSize:12, fontWeight:700, textDecoration:"none", display:"inline-flex", alignItems:"center", gap:4 }}>
+                        💬 {t.label}
+                      </a>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {order.whatsapp && (settings.quickReplies || []).length > 0 && (
+                <div style={{ marginTop:8 }}>
+                  <button onClick={() => setQrOpen(q => !q)}
+                    style={{ padding:"4px 10px", background:C.li, color:C.su, border:`1px solid ${C.bo}`,
+                      borderRadius:6, cursor:"pointer", fontSize:12, fontWeight:700 }}>
+                    💬 Quick Replies {qrOpen ? "▲" : "▼"}
+                  </button>
+                  {qrOpen && (
+                    <div style={{ marginTop:6, display:"flex", flexDirection:"column", gap:4 }}>
+                      {(settings.quickReplies || []).map((qr, i) => (
+                        <a key={i}
+                          href={`https://wa.me/${(order.whatsapp || "").replace(/[^0-9]/g, "")}?text=${encodeURIComponent(qr)}`}
+                          target="_blank" rel="noopener noreferrer"
+                          style={{ padding:"5px 10px", background:C.li, color:C.tx, borderRadius:6,
+                            fontSize:12, textDecoration:"none", display:"block",
+                            border:`1px solid ${C.bo}`, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                          {qr.length > 60 ? qr.slice(0, 60) + "…" : qr}
+                        </a>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
 
               <div style={{ display: "flex", gap: 8, marginBottom: 12, alignItems: "center", flexWrap: "wrap" }}>
                 <span style={{ fontSize: 12, color: C.su, fontWeight: 600, minWidth: isMobile ? 100 : 130 }}>Payment Status</span>
@@ -1806,10 +2353,34 @@ function AdminPanelInner() {
               <Row label="Length"         value={order.length} />
               <Row label="Language"       value={order.language} />
               <Row label="Scene Style"    value={order.sceneStyle} />
+              {order.pricingType && <Row label="Pricing Type" value={order.pricingType} />}
               <Row label="Delivery Speed" value={order.delivery} />
               {(order.archiveReason || order.draftReason) && <Row label="Archive Reason" value={order.archiveReason || order.draftReason} />}
-              <Row label="Deadline"       value={fmtDate(order.deadline)} />
-              {order.deadline && <div style={{ marginBottom: 8 }}><DLChip deadline={order.deadline} /></div>}
+              <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8 }}>
+                <span style={{ fontSize:12, fontWeight:700, color:C.su, minWidth:isMobile ? 100 : 130 }}>Deadline</span>
+                {editDL ? (
+                  <div style={{ display:"flex", gap:6, alignItems:"center", flex:1 }}>
+                    <input type="date" value={dlInput} onChange={e=>setDlInput(e.target.value)}
+                      min={new Date().toISOString().split("T")[0]}
+                      style={{ padding:"4px 8px", borderRadius:6, border:`1px solid ${C.bo}`, background:C.in, color:C.tx, fontSize:13, fontFamily:font }} />
+                    <button onClick={async()=>{
+                      await updateOrder(order, { deadline: dlInput, timeline: arrayUnion({ event:`Deadline changed to ${dlInput}`, ts:fmtTS() }) });
+                      setEditDL(false); toast_("Deadline updated");
+                    }} style={{ padding:"4px 10px", background:C.gr, color:"#fff", border:"none", borderRadius:6, cursor:"pointer", fontWeight:700, fontSize:12, fontFamily:font }}>Save</button>
+                    <button onClick={()=>setEditDL(false)}
+                      style={{ padding:"4px 10px", background:C.li, color:C.tx, border:"none", borderRadius:6, cursor:"pointer", fontSize:12, fontFamily:font }}>Cancel</button>
+                  </div>
+                ) : (
+                  <div style={{ display:"flex", alignItems:"center", gap:6, flex:1 }}>
+                    <span style={{ fontSize:13, color:C.tx }}>{fmtDate(order.deadline)}</span>
+                    {order.deadline && <DLChip deadline={order.deadline} />}
+                    <button onClick={()=>{ setDlInput(order.deadline||""); setEditDL(true); }}
+                      style={{ background:"none", border:"none", cursor:"pointer", padding:2, color:C.su }}>
+                      <Pencil size={13} />
+                    </button>
+                  </div>
+                )}
+              </div>
               <Row label="Mood"           value={order.mood} />
               <Row label="Background"     value={order.backgroundPref} />
             </Sec>
@@ -1869,6 +2440,19 @@ function AdminPanelInner() {
                   ))}
                 </div>
               )}
+              <div style={{ display:"flex", gap:8, marginTop:8 }}>
+                <input value={pinInput} onChange={e => setPinInput(e.target.value)}
+                  placeholder="Pin a note to top of this order..."
+                  style={{ flex:1, padding:"8px 12px", borderRadius:8, border:`1px solid ${C.bo}`,
+                    background:C.in, color:C.tx, fontSize:13 }} />
+                <button onClick={async () => {
+                  if (!pinInput.trim()) return;
+                  await updateOrder(order, { pinnedNote: pinInput.trim(), timeline: arrayUnion({ event:`Note pinned: "${pinInput.trim()}"`, ts: fmtTS() }) });
+                  setPinInput("");
+                  toast_("Note pinned");
+                }} style={{ padding:"6px 14px", background:"#D97706", color:"#fff", border:"none",
+                  borderRadius:8, cursor:"pointer", fontWeight:700, fontSize:13 }}>📌 Pin</button>
+              </div>
             </Sec>
 
             {/* Quick Emails */}
@@ -1926,8 +2510,36 @@ function AdminPanelInner() {
               {order.partnerName && <Row label="Partner Name" value={order.partnerName} />}
 
               {order.scriptChoice === "write" ? (
-                <div style={{ background: C.li, borderRadius: 8, padding: "12px 14px", fontSize: 12, color: C.tx, lineHeight: 1.8, whiteSpace: "pre-wrap", fontFamily: "'Courier New',monospace", border: `1px solid ${C.bo}`, marginTop: 8 }}>
-                  {order.scriptText || "No script provided."}
+                <div style={{ marginBottom:12 }}>
+                  {order.scriptText && (
+                    <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:6 }}>
+                      <span style={{ fontSize:12, fontWeight:700, color:C.su }}>Script</span>
+                      <div style={{ marginLeft:"auto", display:"flex", border:`1px solid ${C.bo}`, borderRadius:6, overflow:"hidden" }}>
+                        <button onClick={() => setScriptRaw(false)}
+                          style={{ padding:"2px 10px", fontSize:11, fontWeight:700, cursor:"pointer", border:"none",
+                            background: !scriptRaw ? C.pu : C.in, color: !scriptRaw ? "#fff" : C.su }}>Preview</button>
+                        <button onClick={() => setScriptRaw(true)}
+                          style={{ padding:"2px 10px", fontSize:11, fontWeight:700, cursor:"pointer", border:"none",
+                            background: scriptRaw ? C.pu : C.in, color: scriptRaw ? "#fff" : C.su }}>Raw</button>
+                      </div>
+                      <button onClick={() => navigator.clipboard.writeText(order.scriptText).then(() => toast_("Script copied!"))}
+                        style={{ background:"none", border:"none", cursor:"pointer", color:C.su, padding:2 }}>
+                        <Copy size={13} />
+                      </button>
+                    </div>
+                  )}
+                  {scriptRaw ? (
+                    <textarea readOnly value={order.scriptText}
+                      style={{ width:"100%", minHeight:160, padding:"10px 12px", borderRadius:8,
+                        border:`1px solid ${C.bo}`, background:C.in, color:C.tx, fontSize:13,
+                        fontFamily:"monospace", resize:"vertical", boxSizing:"border-box" }} />
+                  ) : (
+                    <div style={{ background:C.th, borderRadius:10, padding:"14px 16px",
+                      fontFamily:"Georgia, serif", fontSize:14, lineHeight:1.9,
+                      color:C.tx, whiteSpace:"pre-wrap", wordBreak:"break-word" }}>
+                      {order.scriptText || "No script provided."}
+                    </div>
+                  )}
                 </div>
               ) : (
                 <>
@@ -2062,6 +2674,14 @@ function AdminPanelInner() {
   const SettingsView = () => {
     const [form, setForm] = useState({ ...settings, emailTemplates: JSON.parse(JSON.stringify(settings.emailTemplates)) });
     const [activeEmail, setActiveEmail] = useState("scriptApproved");
+    const [newBlockDate, setNewBlockDate] = useState("");
+    const [newBlackEmail, setNewBlackEmail] = useState("");
+    const [newBlackWA, setNewBlackWA] = useState("");
+    const [curPin, setCurPin] = useState("");
+    const [newPin, setNewPin] = useState("");
+    const [confPin, setConfPin] = useState("");
+    const [pinMsg, setPinMsg] = useState("");
+    const [newHash, setNewHash] = useState("");
     const inpStyle = { width: "100%", padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.bo}`, fontSize: 13, fontFamily: font, color: C.tx, background: C.in, outline: "none", boxSizing: "border-box" };
 
     const save = () => {
@@ -2409,6 +3029,93 @@ function AdminPanelInner() {
             )}
           </div>
 
+          {/* ── Script Split ── */}
+          <div style={{ background:C.ca, borderRadius:14, padding:"14px 18px", marginBottom:14, border:`1px solid ${C.bo}`, boxShadow:sh }}>
+            <div style={{ fontSize:11, fontWeight:800, color:C.su, letterSpacing:0.5, marginBottom:10 }}>✍️ SCRIPT SPLIT</div>
+            {[
+              { label:"Customer writes script", count:analytics.scriptWrite.write, color:C.pu },
+              { label:"Needs help writing", count:analytics.scriptWrite.help, color:C.or },
+            ].map(({ label, count, color }) => {
+              const pct = Math.round(count / analytics.scriptTotal * 100);
+              return (
+                <div key={label} style={{ marginBottom:8 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", fontSize:12, color:C.tx, marginBottom:3 }}>
+                    <span>{label}</span>
+                    <span style={{ fontWeight:700 }}>{count} ({pct}%)</span>
+                  </div>
+                  <div style={{ background:C.bo, borderRadius:6, height:8, overflow:"hidden" }}>
+                    <div style={{ width:`${pct}%`, background:color, height:"100%", borderRadius:6 }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* ── Top Repeat Customers ── */}
+          {analytics.topCustomers.length > 0 && (
+            <div style={{ background:C.ca, borderRadius:14, padding:"14px 18px", marginBottom:14, border:`1px solid ${C.bo}`, boxShadow:sh }}>
+              <div style={{ fontSize:11, fontWeight:800, color:C.su, letterSpacing:0.5, marginBottom:10 }}>⭐ TOP REPEAT CUSTOMERS</div>
+              {analytics.topCustomers.map((c, i) => {
+                const medal = ["🥇","🥈","🥉","4️⃣","5️⃣"][i];
+                const lastOrder = orders.filter(o => o.email === c.email).sort((a, b) => (b.date||"").localeCompare(a.date||""))[0];
+                return (
+                  <div key={c.email} onClick={() => { if (lastOrder) { setSelId(lastOrder.id); setPage("detail"); } }}
+                    style={{ display:"flex", alignItems:"center", gap:8, padding:"6px 0",
+                      borderBottom: i < analytics.topCustomers.length-1 ? `1px solid ${C.bo}` : "none",
+                      cursor: lastOrder ? "pointer" : "default" }}>
+                    <span style={{ fontSize:16 }}>{medal}</span>
+                    <div style={{ flex:1 }}>
+                      <div style={{ fontSize:13, fontWeight:700, color:C.tx }}>{c.name}</div>
+                      <div style={{ fontSize:11, color:C.su }}>{c.email}</div>
+                    </div>
+                    <div style={{ textAlign:"right" }}>
+                      <div style={{ fontSize:12, fontWeight:700, color:C.pu }}>{c.count} orders</div>
+                      <div style={{ fontSize:11, color:C.su }}>${c.rev} total</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* ── Language Distribution ── */}
+          {analytics.languages.length > 0 && (
+            <div style={{ background:C.ca, borderRadius:14, padding:"14px 18px", marginBottom:14, border:`1px solid ${C.bo}`, boxShadow:sh }}>
+              <div style={{ fontSize:11, fontWeight:800, color:C.su, letterSpacing:0.5, marginBottom:10 }}>🌐 LANGUAGE DISTRIBUTION</div>
+              {analytics.languages.map(({ lang, count, pct }) => (
+                <div key={lang} style={{ marginBottom:8 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", fontSize:12, color:C.tx, marginBottom:3 }}>
+                    <span>{lang}</span>
+                    <span style={{ fontWeight:700 }}>{count} ({pct}%)</span>
+                  </div>
+                  <div style={{ background:C.bo, borderRadius:6, height:8, overflow:"hidden" }}>
+                    <div style={{ width:`${pct}%`, background:C.pu, height:"100%", borderRadius:6 }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* ── Admin Activity Chart ── */}
+          {analytics.productivityDays && analytics.productivityDays.length > 0 && (
+            <div style={{ background:C.ca, borderRadius:14, padding:"14px 18px", marginBottom:14, border:`1px solid ${C.bo}`, boxShadow:sh }}>
+              <div style={{ fontSize:11, fontWeight:800, color:C.su, letterSpacing:0.5, marginBottom:10 }}>⚡ ADMIN ACTIVITY (LAST 7 ACTIVE DAYS)</div>
+              <div style={{ display:"flex", alignItems:"flex-end", gap:6, height:80 }}>
+                {analytics.productivityDays.map(({ label, count }) => (
+                  <div key={label} style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:3 }}>
+                    <div style={{ fontSize:10, fontWeight:700, color:C.tx }}>{count}</div>
+                    <div style={{ width:"100%", background:C.pu, borderRadius:"4px 4px 0 0",
+                      height:`${Math.round((count / analytics.maxCount) * 60)}px`, minHeight:4 }} />
+                    <div style={{ fontSize:9, color:C.su, textAlign:"center", lineHeight:1.1 }}>{label}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ fontSize:11, color:C.su, marginTop:6, textAlign:"center" }}>
+                Avg {analytics.avgCount} status changes/day
+              </div>
+            </div>
+          )}
+
           {/* ── Notifications & Alerts System ── */}
           <div style={{ background: C.ca, borderRadius: 14, border: `1px solid ${C.bo}`, padding: "18px 20px", marginBottom: 14, boxShadow: sh }}>
             <div style={{ fontSize: 12, fontWeight: 800, color: C.su, letterSpacing: 1, marginBottom: 14 }}>🔔 NOTIFICATIONS & ALERTS STATUS</div>
@@ -2532,6 +3239,14 @@ function AdminPanelInner() {
                   <div style={{ fontSize: 11, fontWeight: 700, color: C.su, marginBottom: 6 }}>LONG VIDEO PRICE ($)</div>
                   <input type="number" value={form.longPrice} onChange={e => setForm(f => ({ ...f, longPrice: e.target.value }))} style={inpStyle} />
                 </div>
+                <div style={{ fontSize: 11, color: "#6B7280", marginTop: 4 }}>
+                  Short price applies to videos with "40", "30", or "45" in the length name. Long price applies to all others.
+                </div>
+                <div style={{ marginBottom:12 }}>
+                  <label style={{ fontSize:11, fontWeight:700, color:C.su, display:"block", marginBottom:4 }}>Monthly Revenue Goal ($)</label>
+                  <input type="number" value={form.monthlyGoal||500} onChange={e=>setForm(f=>({...f,monthlyGoal:Number(e.target.value)}))}
+                    style={{ width:"100%", padding:"8px 12px", borderRadius:8, border:`1px solid ${C.bo}`, background:C.in, color:C.tx, fontSize:14, outline:"none", boxSizing:"border-box", fontFamily:font }} />
+                </div>
               </div>
             </Sec>
 
@@ -2579,6 +3294,24 @@ function AdminPanelInner() {
               </div>
             </Sec>
 
+            {/* Overdue Alert Toggle */}
+            <Sec title="OVERDUE ALERT" icon={Bell}>
+              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
+                <div>
+                  <div style={{ fontSize:13, fontWeight:700, color:C.tx }}>Overdue WhatsApp Alert</div>
+                  <div style={{ fontSize:11, color:C.su }}>Send WhatsApp alert when an order goes overdue</div>
+                </div>
+                <button onClick={() => {
+                  const updated = { ...form, overdueAlertEnabled: !(form.overdueAlertEnabled !== false) };
+                  setForm(updated);
+                }} style={{ padding:"4px 12px", borderRadius:20, border:`1px solid ${C.bo}`, cursor:"pointer",
+                  background: form.overdueAlertEnabled !== false ? C.gr : C.li,
+                  color: form.overdueAlertEnabled !== false ? "#fff" : C.su, fontWeight:700, fontSize:12 }}>
+                  {form.overdueAlertEnabled !== false ? "ON" : "OFF"}
+                </button>
+              </div>
+            </Sec>
+
             {/* Working Hours */}
             <Sec title="WORKING HOURS" icon={Clock}>
               <div style={{ display: "flex", flexDirection: isMobile ? "column" : "row", gap: 12 }}>
@@ -2609,7 +3342,196 @@ function AdminPanelInner() {
               </div>
             </Sec>
 
+            {/* Unavailable Dates */}
+            <Sec title="UNAVAILABLE DATES" icon={Calendar}>
+              <div style={{ display:"flex", gap:8, marginBottom:8 }}>
+                <input type="date" value={newBlockDate} onChange={e=>setNewBlockDate(e.target.value)}
+                  min={new Date().toISOString().split("T")[0]}
+                  style={{ flex:1, padding:"8px 12px", borderRadius:8, border:`1px solid ${C.bo}`, background:C.in, color:C.tx, fontSize:14, outline:"none", fontFamily:font }} />
+                <button onClick={async()=>{
+                  if (!newBlockDate) return;
+                  const updated = { ...form, blockedDates: [...(form.blockedDates||[]), newBlockDate].filter((v,i,a)=>a.indexOf(v)===i) };
+                  setForm(updated);
+                  localStorage.setItem("bubududu_settings", JSON.stringify(updated));
+                  setSettings(updated);
+                  try { await setDoc(doc(db,"settings","availability"),{ blockedDates:updated.blockedDates, updatedAt:serverTimestamp() },{ merge:true }); } catch(e){ console.warn(e); }
+                  setNewBlockDate("");
+                  toast_("Date blocked");
+                }} style={{ padding:"8px 14px", background:C.re, color:"#fff", border:"none", borderRadius:8, cursor:"pointer", fontWeight:700, fontSize:13, fontFamily:font }}>Block</button>
+              </div>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                {(form.blockedDates||[]).map(d=>(
+                  <div key={d} style={{ background:C.li, borderRadius:20, padding:"3px 10px", fontSize:12, color:C.tx, display:"flex", alignItems:"center", gap:4 }}>
+                    {d}
+                    <button onClick={async()=>{
+                      const updated = { ...form, blockedDates:(form.blockedDates||[]).filter(x=>x!==d) };
+                      setForm(updated);
+                      localStorage.setItem("bubududu_settings", JSON.stringify(updated));
+                      setSettings(updated);
+                      try { await setDoc(doc(db,"settings","availability"),{ blockedDates:updated.blockedDates, updatedAt:serverTimestamp() },{ merge:true }); } catch(e){ console.warn(e); }
+                      toast_("Date unblocked");
+                    }} style={{ background:"none", border:"none", cursor:"pointer", color:C.re, fontWeight:700, fontSize:13, padding:0 }}>×</button>
+                  </div>
+                ))}
+              </div>
+            </Sec>
+
+            {/* PIN Change */}
+            <Sec title="CHANGE PIN" icon={Hash}>
+              <div style={{ background:"#FFF7ED", border:"1px solid #FDE68A", borderRadius:8, padding:"8px 12px", marginBottom:10, fontSize:12, color:"#92400E" }}>
+                ⚠️ PIN change requires a code update + redeploy to take effect permanently.
+              </div>
+              <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+                <input type="password" placeholder="Current PIN" value={curPin} onChange={e=>{setCurPin(e.target.value);setPinMsg("");setNewHash("");}}
+                  style={{ padding:"8px 12px", borderRadius:8, border:`1px solid ${C.bo}`, background:C.in, color:C.tx, fontSize:14, outline:"none", fontFamily:font }} />
+                <input type="password" placeholder="New PIN (min 4 digits)" value={newPin} onChange={e=>{setNewPin(e.target.value);setPinMsg("");setNewHash("");}}
+                  style={{ padding:"8px 12px", borderRadius:8, border:`1px solid ${C.bo}`, background:C.in, color:C.tx, fontSize:14, outline:"none", fontFamily:font }} />
+                <input type="password" placeholder="Confirm New PIN" value={confPin} onChange={e=>{setConfPin(e.target.value);setPinMsg("");setNewHash("");}}
+                  style={{ padding:"8px 12px", borderRadius:8, border:`1px solid ${C.bo}`, background:C.in, color:C.tx, fontSize:14, outline:"none", fontFamily:font }} />
+                <button onClick={async()=>{
+                  const curHash = await hashPin(curPin);
+                  if (curHash !== ADMIN_PIN_HASH) { setPinMsg("Current PIN is incorrect."); return; }
+                  if (newPin.length < 4) { setPinMsg("New PIN must be at least 4 digits."); return; }
+                  if (newPin !== confPin) { setPinMsg("New PINs do not match."); return; }
+                  const h = await hashPin(newPin);
+                  setNewHash(h);
+                  setPinMsg("success");
+                }} style={{ padding:"8px 14px", background:C.pu, color:"#fff", border:"none", borderRadius:8, cursor:"pointer", fontWeight:700, fontSize:13, fontFamily:font }}>Generate New Hash</button>
+                {pinMsg && pinMsg !== "success" && <div style={{ color:C.re, fontSize:12 }}>{pinMsg}</div>}
+                {newHash && (
+                  <div style={{ background:C.li, borderRadius:8, padding:"10px 12px", fontSize:12 }}>
+                    <div style={{ fontWeight:700, color:C.tx, marginBottom:4 }}>New PIN Hash:</div>
+                    <div style={{ fontFamily:"monospace", wordBreak:"break-all", color:C.pu, marginBottom:6 }}>{newHash}</div>
+                    <div style={{ color:C.su }}>Copy this hash and replace ADMIN_PIN_HASH in AdminV6/src/App.js line 38, then redeploy.</div>
+                  </div>
+                )}
+              </div>
+            </Sec>
+
+            <div style={{ marginTop:20, paddingTop:20, borderTop:`1px solid ${C.bo}` }}>
+              <div style={{ fontWeight:700, color:C.tx, fontSize:13, marginBottom:12 }}>BLACKLIST MANAGER</div>
+
+              {/* Email blacklist */}
+              <div style={{ marginBottom:14 }}>
+                <div style={{ fontSize:11, fontWeight:700, color:C.su, marginBottom:6 }}>BLOCKED EMAILS</div>
+                <div style={{ display:"flex", gap:8, marginBottom:8 }}>
+                  <input type="email" value={newBlackEmail} onChange={e => setNewBlackEmail(e.target.value)}
+                    placeholder="email@example.com"
+                    style={{ flex:1, padding:"8px 12px", borderRadius:8, border:`1px solid ${C.bo}`, background:C.in, color:C.tx, fontSize:14 }} />
+                  <button onClick={async () => {
+                    const val = newBlackEmail.trim().toLowerCase();
+                    if (!val) return;
+                    const updated = { ...form, blacklistedEmails: [...(form.blacklistedEmails||[]), val].filter((v,i,a)=>a.indexOf(v)===i) };
+                    setForm(updated);
+                    localStorage.setItem("bubududu_settings", JSON.stringify(updated));
+                    setSettings(updated);
+                    try { await setDoc(doc(db,"settings","blacklist"), { emails: updated.blacklistedEmails||[], whatsapp: updated.blacklistedWhatsapp||[], updatedAt: serverTimestamp() }, { merge: true }); } catch(e){ console.warn(e); }
+                    setNewBlackEmail("");
+                    toast_("Email blacklisted");
+                  }} style={{ padding:"8px 14px", background:C.re, color:"#fff", border:"none", borderRadius:8, cursor:"pointer", fontWeight:700, fontSize:13 }}>Block</button>
+                </div>
+                <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                  {(form.blacklistedEmails||[]).map(e => (
+                    <div key={e} style={{ background:C.li, borderRadius:20, padding:"3px 10px", fontSize:12, color:C.tx, display:"flex", alignItems:"center", gap:4 }}>
+                      {e}
+                      <button onClick={async () => {
+                        const updated = { ...form, blacklistedEmails: (form.blacklistedEmails||[]).filter(x=>x!==e) };
+                        setForm(updated);
+                        localStorage.setItem("bubududu_settings", JSON.stringify(updated));
+                        setSettings(updated);
+                        try { await setDoc(doc(db,"settings","blacklist"), { emails: updated.blacklistedEmails||[], whatsapp: updated.blacklistedWhatsapp||[], updatedAt: serverTimestamp() }, { merge: true }); } catch(err){ console.warn(err); }
+                        toast_("Email removed from blacklist");
+                      }} style={{ background:"none", border:"none", cursor:"pointer", color:C.re, fontWeight:700, fontSize:13, padding:0 }}>×</button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* WhatsApp blacklist */}
+              <div>
+                <div style={{ fontSize:11, fontWeight:700, color:C.su, marginBottom:6 }}>BLOCKED WHATSAPP NUMBERS</div>
+                <div style={{ display:"flex", gap:8, marginBottom:8 }}>
+                  <input type="tel" value={newBlackWA} onChange={e => setNewBlackWA(e.target.value)}
+                    placeholder="+1234567890"
+                    style={{ flex:1, padding:"8px 12px", borderRadius:8, border:`1px solid ${C.bo}`, background:C.in, color:C.tx, fontSize:14 }} />
+                  <button onClick={async () => {
+                    const val = newBlackWA.trim();
+                    if (!val) return;
+                    const updated = { ...form, blacklistedWhatsapp: [...(form.blacklistedWhatsapp||[]), val].filter((v,i,a)=>a.indexOf(v)===i) };
+                    setForm(updated);
+                    localStorage.setItem("bubududu_settings", JSON.stringify(updated));
+                    setSettings(updated);
+                    try { await setDoc(doc(db,"settings","blacklist"), { emails: updated.blacklistedEmails||[], whatsapp: updated.blacklistedWhatsapp||[], updatedAt: serverTimestamp() }, { merge: true }); } catch(e){ console.warn(e); }
+                    setNewBlackWA("");
+                    toast_("WhatsApp blacklisted");
+                  }} style={{ padding:"8px 14px", background:C.re, color:"#fff", border:"none", borderRadius:8, cursor:"pointer", fontWeight:700, fontSize:13 }}>Block</button>
+                </div>
+                <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                  {(form.blacklistedWhatsapp||[]).map(w => (
+                    <div key={w} style={{ background:C.li, borderRadius:20, padding:"3px 10px", fontSize:12, color:C.tx, display:"flex", alignItems:"center", gap:4 }}>
+                      {w}
+                      <button onClick={async () => {
+                        const updated = { ...form, blacklistedWhatsapp: (form.blacklistedWhatsapp||[]).filter(x=>x!==w) };
+                        setForm(updated);
+                        localStorage.setItem("bubududu_settings", JSON.stringify(updated));
+                        setSettings(updated);
+                        try { await setDoc(doc(db,"settings","blacklist"), { emails: updated.blacklistedEmails||[], whatsapp: updated.blacklistedWhatsapp||[], updatedAt: serverTimestamp() }, { merge: true }); } catch(err){ console.warn(err); }
+                        toast_("WhatsApp removed from blacklist");
+                      }} style={{ background:"none", border:"none", cursor:"pointer", color:C.re, fontWeight:700, fontSize:13, padding:0 }}>×</button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Webhook / Automation */}
+            <Sec title="WEBHOOK / AUTOMATION" icon={Activity}>
+              <div style={{ marginTop:0, paddingTop:0 }}>
+                <div style={{ fontWeight:700, color:C.tx, fontSize:13, marginBottom:8 }}>WEBHOOK / AUTOMATION</div>
+                <div style={{ fontSize:11, color:C.su, marginBottom:8 }}>Fire a webhook on status changes (Zapier, Make, etc.)</div>
+                <div style={{ marginBottom:8 }}>
+                  <input type="url" value={form.webhookUrl||""} onChange={e => setForm(f => ({ ...f, webhookUrl: e.target.value }))}
+                    placeholder="https://hooks.zapier.com/hooks/catch/..."
+                    style={{ width:"100%", padding:"8px 12px", borderRadius:8, border:`1px solid ${C.bo}`, background:C.in, color:C.tx, fontSize:13 }} />
+                </div>
+                <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                  <button onClick={() => setForm(f => ({ ...f, webhookEnabled: !f.webhookEnabled }))}
+                    style={{ padding:"4px 12px", borderRadius:20, border:`1px solid ${C.bo}`, cursor:"pointer",
+                      background: form.webhookEnabled ? C.gr : C.li, color: form.webhookEnabled ? "#fff" : C.su, fontWeight:700, fontSize:12 }}>
+                    {form.webhookEnabled ? "ENABLED" : "DISABLED"}
+                  </button>
+                  <span style={{ fontSize:11, color:C.su }}>Toggle to enable/disable webhook firing</span>
+                </div>
+              </div>
+            </Sec>
+
+            {/* Quick Replies */}
+            <Sec title="QUICK REPLIES" icon={MessageCircle}>
+              <div style={{ marginTop:0, paddingTop:0 }}>
+                <div style={{ fontWeight:700, color:C.tx, fontSize:13, marginBottom:10 }}>QUICK REPLIES</div>
+                {(form.quickReplies || []).map((qr, i) => (
+                  <div key={i} style={{ marginBottom:8 }}>
+                    <textarea value={qr} onChange={e => {
+                      const updated = [...(form.quickReplies || [])];
+                      updated[i] = e.target.value;
+                      setForm(f => ({ ...f, quickReplies: updated }));
+                    }} rows={2}
+                      style={{ width:"100%", padding:"8px 12px", borderRadius:8, border:`1px solid ${C.bo}`,
+                        background:C.in, color:C.tx, fontSize:13, resize:"vertical", boxSizing:"border-box" }} />
+                  </div>
+                ))}
+              </div>
+            </Sec>
+
             <Btn color={C.pu} onClick={save} icon={Check}>Save Settings</Btn>
+            <div style={{
+              fontSize: 11, color: "#D97706", background: "#FFFBEB",
+              border: "1px solid #FDE68A", borderRadius: 8,
+              padding: "8px 12px", marginTop: 12,
+            }}>
+              ⚠️ Settings are saved on this device only.
+              If you use another device or browser, re-enter your settings there.
+            </div>
           </div>
         )}
 
